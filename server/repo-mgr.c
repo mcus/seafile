@@ -636,12 +636,14 @@ create_repo_fill_size (SeafDBRow *row, void *data)
 
     const char *repo_id = seaf_db_row_get_column_text (row, 0);
     gint64 size = seaf_db_row_get_column_int64 (row, 1);
+    gint64 file_count = seaf_db_row_get_column_int64 (row, 2);
 
     *repo = seaf_repo_new (repo_id, NULL, NULL);
     if (!*repo)
         return FALSE;
 
     (*repo)->size = size;
+    (*repo)->file_count = file_count;
 
     return TRUE;
 }
@@ -650,8 +652,9 @@ static SeafRepo*
 get_repo_from_db (SeafRepoManager *mgr, const char *id, gboolean *db_err)
 {
     SeafRepo *repo = NULL;
-    const char *sql = "SELECT r.repo_id, s.size FROM Repo r left join RepoSize s "
-                      "ON r.repo_id = s.repo_id WHERE r.repo_id = ?";
+    const char *sql = "SELECT r.repo_id, s.size, c.file_count FROM "
+                      "Repo r LEFT JOIN RepoSize s ON r.repo_id = s.repo_id "
+                      "LEFT JOIN RepoFileCount c ON r.repo_id = c.repo_id WHERE r.repo_id = ?";
 
     int ret = seaf_db_statement_foreach_row (mgr->seaf->db, sql,
                                              create_repo_fill_size, &repo,
@@ -912,6 +915,12 @@ create_tables_mysql (SeafRepoManager *mgr)
     if (seaf_db_query (db, sql) < 0)
         return -1;
 
+    sql = "CREATE TABLE IF NOT EXISTS RepoFileCount ("
+        "repo_id CHAR(36) PRIMARY KEY,"
+        "file_count BIGINT UNSIGNED)ENGINE=INNODB";
+    if (seaf_db_query (db, sql) < 0)
+        return -1;
+
     return 0;
 }
 
@@ -1047,6 +1056,12 @@ create_tables_sqlite (SeafRepoManager *mgr)
     if (seaf_db_query (db, sql) < 0)
         return -1;
 
+    sql = "CREATE TABLE IF NOT EXISTS RepoFileCount ("
+        "repo_id CHAR(36) PRIMARY KEY,"
+        "file_count BIGINT UNSIGNED)";
+    if (seaf_db_query (db, sql) < 0)
+        return -1;
+
     return 0;
 }
 
@@ -1177,6 +1192,12 @@ create_tables_pgsql (SeafRepoManager *mgr)
         if (seaf_db_query (db, sql) < 0)
             return -1;
     }
+
+    sql = "CREATE TABLE IF NOT EXISTS RepoFileCount ("
+        "repo_id CHAR(36) PRIMARY KEY,"
+        "file_count BIGINT)";
+    if (seaf_db_query (db, sql) < 0)
+        return -1;
 
     return 0;
 }
@@ -2557,6 +2578,7 @@ get_group_repos_cb (SeafDBRow *row, void *data)
     const char *permission = seaf_db_row_get_column_text (row, 4);
     const char *commit_id = seaf_db_row_get_column_text (row, 5);
     gint64 size = seaf_db_row_get_column_int64 (row, 6);
+    gint64 file_count = seaf_db_row_get_column_int64 (row, 7);
 
     char *user_name_l = g_ascii_strdown (user_name, -1);
 
@@ -2570,13 +2592,14 @@ get_group_repos_cb (SeafDBRow *row, void *data)
                           "permission", permission,
                           "is_virtual", (vrepo_id != NULL),
                           "size", size,
+                          "file_count", file_count,
                           NULL);
     g_free (user_name_l);
 
     if (srepo != NULL) {
         if (vrepo_id) {
-            const char *origin_repo_id = seaf_db_row_get_column_text (row, 7);
-            const char *origin_path = seaf_db_row_get_column_text (row, 8);
+            const char *origin_repo_id = seaf_db_row_get_column_text (row, 8);
+            const char *origin_path = seaf_db_row_get_column_text (row, 9);
             g_object_set (srepo, "store_id", origin_repo_id,
                           "origin_repo_id", origin_repo_id,
                           "origin_path", origin_path, NULL);
@@ -2641,11 +2664,12 @@ seaf_repo_manager_get_repos_by_group (SeafRepoManager *mgr,
     GList *p;
 
     sql = "SELECT RepoGroup.repo_id, VirtualRepo.repo_id, "
-        "group_id, user_name, permission, commit_id, s.size, "
+        "group_id, user_name, permission, commit_id, s.size, c.file_count, "
         "VirtualRepo.origin_repo, VirtualRepo.path "
         "FROM RepoGroup LEFT JOIN VirtualRepo ON "
         "RepoGroup.repo_id = VirtualRepo.repo_id "
-        "LEFT JOIN RepoSize s ON RepoGroup.repo_id = s.repo_id, "
+        "LEFT JOIN RepoSize s ON RepoGroup.repo_id = s.repo_id "
+        "LEFT JOIN RepoFileCount c ON RepoGroup.repo_id = c.repo_id, "
         "Branch WHERE group_id = ? AND "
         "RepoGroup.repo_id = Branch.repo_id AND "
         "Branch.name = 'master'";
@@ -2676,11 +2700,12 @@ seaf_repo_manager_get_group_repos_by_owner (SeafRepoManager *mgr,
     GList *p;
 
     sql = "SELECT RepoGroup.repo_id, VirtualRepo.repo_id, "
-        "group_id, user_name, permission, commit_id, s.size, "
+        "group_id, user_name, permission, commit_id, s.size, c.file_count, "
         "VirtualRepo.origin_repo, VirtualRepo.path "
         "FROM RepoGroup LEFT JOIN VirtualRepo ON "
         "RepoGroup.repo_id = VirtualRepo.repo_id "
-        "LEFT JOIN RepoSize s ON RepoGroup.repo_id = s.repo_id, "
+        "LEFT JOIN RepoSize s ON RepoGroup.repo_id = s.repo_id "
+        "LEFT JOIN RepoFileCount c ON RepoGroup.repo_id = c.repo_id, "
         "Branch WHERE user_name = ? AND "
         "RepoGroup.repo_id = Branch.repo_id AND "
         "Branch.name = 'master'";
@@ -2813,6 +2838,7 @@ collect_public_repos (SeafDBRow *row, void *data)
     SeafileRepo *srepo;
     const char *repo_id, *vrepo_id, *owner, *permission, *commit_id;
     gint64 size;
+    gint64 file_count;
 
     repo_id = seaf_db_row_get_column_text (row, 0);
     vrepo_id = seaf_db_row_get_column_text (row, 1);
@@ -2820,6 +2846,7 @@ collect_public_repos (SeafDBRow *row, void *data)
     permission = seaf_db_row_get_column_text (row, 3);
     commit_id = seaf_db_row_get_column_text (row, 4);
     size = seaf_db_row_get_column_int64 (row, 5);
+    file_count = seaf_db_row_get_column_int64 (row, 6);
 
     char *owner_l = g_ascii_strdown (owner, -1);
 
@@ -2832,13 +2859,14 @@ collect_public_repos (SeafDBRow *row, void *data)
                           "user", owner_l,
                           "is_virtual", (vrepo_id != NULL),
                           "size", size,
+                          "file_count", file_count,
                           NULL);
     g_free (owner_l);
 
     if (srepo) {
         if (vrepo_id) {
-            const char *origin_repo_id = seaf_db_row_get_column_text (row, 6);
-            const char *origin_path = seaf_db_row_get_column_text (row, 7);
+            const char *origin_repo_id = seaf_db_row_get_column_text (row, 7);
+            const char *origin_path = seaf_db_row_get_column_text (row, 8);
             g_object_set (srepo, "store_id", origin_repo_id,
                           "origin_repo_id", origin_repo_id,
                           "origin_path", origin_path, NULL);
@@ -2859,11 +2887,12 @@ seaf_repo_manager_list_inner_pub_repos (SeafRepoManager *mgr)
     char *sql;
 
     sql = "SELECT InnerPubRepo.repo_id, VirtualRepo.repo_id, "
-        "owner_id, permission, commit_id, s.size, "
+        "owner_id, permission, commit_id, s.size, c.file_count, "
         "VirtualRepo.origin_repo, VirtualRepo.path "
         "FROM InnerPubRepo LEFT JOIN VirtualRepo ON "
         "InnerPubRepo.repo_id=VirtualRepo.repo_id "
-        "LEFT JOIN RepoSize s ON InnerPubRepo.repo_id = s.repo_id, RepoOwner, Branch "
+        "LEFT JOIN RepoSize s ON InnerPubRepo.repo_id = s.repo_id "
+        "LEFT JOIN RepoFileCount c ON InnerPubRepo.repo_id = c.repo_id, RepoOwner, Branch "
         "WHERE InnerPubRepo.repo_id=RepoOwner.repo_id AND "
         "InnerPubRepo.repo_id = Branch.repo_id AND Branch.name = 'master'";
 
@@ -2899,11 +2928,12 @@ seaf_repo_manager_list_inner_pub_repos_by_owner (SeafRepoManager *mgr,
     char *sql;
 
     sql = "SELECT InnerPubRepo.repo_id, VirtualRepo.repo_id, "
-        "owner_id, permission, commit_id, s.size, "
+        "owner_id, permission, commit_id, s.size, c.file_count, "
         "VirtualRepo.origin_repo, VirtualRepo.path "
         "FROM InnerPubRepo LEFT JOIN VirtualRepo ON "
         "InnerPubRepo.repo_id=VirtualRepo.repo_id "
-        "LEFT JOIN RepoSize s ON InnerPubRepo.repo_id = s.repo_id, RepoOwner, Branch "
+        "LEFT JOIN RepoSize s ON InnerPubRepo.repo_id = s.repo_id "
+        "LEFT JOIN RepoFileCount c ON InnerPubRepo.repo_id = c.repo_id, RepoOwner, Branch "
         "WHERE InnerPubRepo.repo_id=RepoOwner.repo_id AND owner_id=? "
         "AND InnerPubRepo.repo_id = Branch.repo_id AND Branch.name = 'master'";
 
