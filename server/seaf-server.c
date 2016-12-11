@@ -23,7 +23,6 @@
 #include "log.h"
 #include "utils.h"
 
-#include "processors/check-tx-slave-v2-proc.h"
 #include "processors/check-tx-slave-v3-proc.h"
 #include "processors/recvfs-proc.h"
 #include "processors/putfs-proc.h"
@@ -51,11 +50,12 @@ SearpcClient *async_ccnetrpc_client_t;
 
 char *pidfile = NULL;
 
-static const char *short_options = "hvc:d:l:fg:G:P:mCD:";
+static const char *short_options = "hvc:d:l:fg:G:P:mCD:F:";
 static struct option long_options[] = {
     { "help", no_argument, NULL, 'h', },
     { "version", no_argument, NULL, 'v', },
     { "config-file", required_argument, NULL, 'c' },
+    { "central-config-dir", required_argument, NULL, 'F' },
     { "seafdir", required_argument, NULL, 'd' },
     { "log", required_argument, NULL, 'l' },
     { "debug", required_argument, NULL, 'D' },
@@ -75,8 +75,6 @@ static void usage ()
 
 static void register_processors (CcnetClient *client)
 {
-    ccnet_register_service (client, "seafile-check-tx-slave-v2", "basic",
-                            SEAFILE_TYPE_CHECK_TX_SLAVE_V2_PROC, NULL);
     ccnet_register_service (client, "seafile-check-tx-slave-v3", "basic",
                             SEAFILE_TYPE_CHECK_TX_SLAVE_V3_PROC, NULL);
     ccnet_register_service (client, "seafile-recvfs", "basic",
@@ -176,7 +174,7 @@ static void start_rpc_service (CcnetClient *client, int cloud_mode)
     searpc_server_register_function ("seafserv-threaded-rpcserver",
                                      seafile_list_owned_repos,
                                      "seafile_list_owned_repos",
-                                     searpc_signature_objlist__string());
+                                     searpc_signature_objlist__string_int());
 
     searpc_server_register_function ("seafserv-threaded-rpcserver",
                                      seafile_server_repo_size,
@@ -248,7 +246,7 @@ static void start_rpc_service (CcnetClient *client, int cloud_mode)
     searpc_server_register_function ("seafserv-threaded-rpcserver",
                                      seafile_move_file,
                                      "seafile_move_file",
-       searpc_signature_object__string_string_string_string_string_string_string_int_int());
+       searpc_signature_object__string_string_string_string_string_string_int_string_int_int());
 
     searpc_server_register_function ("seafserv-threaded-rpcserver",
                                      seafile_rename_file,
@@ -286,8 +284,8 @@ static void start_rpc_service (CcnetClient *client, int cloud_mode)
                                      searpc_signature_objlist__string_string_string_string_int_int());
 
     searpc_server_register_function ("seafserv-threaded-rpcserver",
-                                     seafile_list_file,
-                                     "seafile_list_file",
+                                     seafile_list_file_blocks,
+                                     "seafile_list_file_blocks",
                                      searpc_signature_string__string_string_int_int());
     
     searpc_server_register_function ("seafserv-threaded-rpcserver",
@@ -306,8 +304,8 @@ static void start_rpc_service (CcnetClient *client, int cloud_mode)
                                      searpc_signature_objlist__string_string_string());
 
     searpc_server_register_function ("seafserv-threaded-rpcserver",
-                                     seafile_get_dirid_by_path,
-                                     "seafile_get_dirid_by_path",
+                                     seafile_get_dir_id_by_commit_and_path,
+                                     "seafile_get_dir_id_by_commit_and_path",
                                      searpc_signature_string__string_string_string());
 
     searpc_server_register_function ("seafserv-threaded-rpcserver",
@@ -346,9 +344,14 @@ static void start_rpc_service (CcnetClient *client, int cloud_mode)
                                      searpc_signature_int__string_string_string_string());
 
     searpc_server_register_function ("seafserv-threaded-rpcserver",
+                                     seafile_check_repo_blocks_missing,
+                                     "seafile_check_repo_blocks_missing",
+                                     searpc_signature_string__string_string());
+
+    searpc_server_register_function ("seafserv-threaded-rpcserver",
                                      seafile_get_deleted,
                                      "get_deleted",
-                                     searpc_signature_objlist__string_int_string());
+                                     searpc_signature_objlist__string_int_string_string_int());
 
     /* share repo to user */
     searpc_server_register_function ("seafserv-threaded-rpcserver",
@@ -373,6 +376,21 @@ static void start_rpc_service (CcnetClient *client, int cloud_mode)
                                      "set_share_permission",
                                      searpc_signature_int__string_string_string_string());
 
+    searpc_server_register_function ("seafserv-threaded-rpcserver",
+                                     seafile_share_subdir_to_user,
+                                     "share_subdir_to_user",
+                                     searpc_signature_int__string_string_string_string_string_string());
+
+    searpc_server_register_function ("seafserv-threaded-rpcserver",
+                                     seafile_unshare_subdir_for_user,
+                                     "unshare_subdir_for_user",
+                                     searpc_signature_int__string_string_string_string());
+
+    searpc_server_register_function ("seafserv-threaded-rpcserver",
+                                     seafile_update_share_subdir_perm_for_user,
+                                     "update_share_subdir_perm_for_user",
+                                     searpc_signature_int__string_string_string_string_string());
+
     /* share repo to group */
     searpc_server_register_function ("seafserv-threaded-rpcserver",
                                      seafile_group_share_repo,
@@ -386,7 +404,22 @@ static void start_rpc_service (CcnetClient *client, int cloud_mode)
                                      seafile_get_shared_groups_by_repo,
                                      "seafile_get_shared_groups_by_repo",
                                      searpc_signature_string__string());
-    
+
+    searpc_server_register_function ("seafserv-threaded-rpcserver",
+                                     seafile_share_subdir_to_group,
+                                     "share_subdir_to_group",
+                                     searpc_signature_int__string_string_string_int_string_string());
+
+    searpc_server_register_function ("seafserv-threaded-rpcserver",
+                                     seafile_unshare_subdir_for_group,
+                                     "unshare_subdir_for_group",
+                                     searpc_signature_int__string_string_string_int());
+
+    searpc_server_register_function ("seafserv-threaded-rpcserver",
+                                     seafile_update_share_subdir_perm_for_group,
+                                     "update_share_subdir_perm_for_group",
+                                     searpc_signature_int__string_string_string_int_string());
+
     searpc_server_register_function ("seafserv-threaded-rpcserver",
                                      seafile_get_group_repoids,
                                      "seafile_get_group_repoids",
@@ -511,6 +544,11 @@ static void start_rpc_service (CcnetClient *client, int cloud_mode)
                                      seafile_web_query_access_token,
                                      "seafile_web_query_access_token",
                                      searpc_signature_object__string());
+
+    searpc_server_register_function ("seafserv-rpcserver",
+                                     seafile_query_zip_progress,
+                                     "seafile_query_zip_progress",
+                                     searpc_signature_string__string());
 
     /* Copy task related. */
 
@@ -685,13 +723,13 @@ set_signal_handlers (SeafileSession *session)
 }
 
 static void
-create_sync_rpc_clients (const char *config_dir)
+create_sync_rpc_clients (const char *central_config_dir, const char *config_dir)
 {
     CcnetClient *sync_client;
 
     /* sync client and rpc client */
     sync_client = ccnet_client_new ();
-    if ( (ccnet_client_load_confdir(sync_client, config_dir)) < 0 ) {
+    if ( (ccnet_client_load_confdir(sync_client, central_config_dir, config_dir)) < 0 ) {
         seaf_warning ("Read config dir error\n");
         exit(1);
     }
@@ -767,6 +805,8 @@ load_history_config ()
                                                 &error);
     if (error == NULL)
         seaf->keep_history_days = keep_history_days;
+    else
+        g_clear_error (&error);
 }
 
 static void
@@ -808,6 +848,7 @@ main (int argc, char **argv)
     int c;
     char *config_dir = DEFAULT_CONFIG_DIR;
     char *seafile_dir = NULL;
+    char *central_config_dir = NULL;
     char *logfile = NULL;
     const char *debug_str = NULL;
     int daemon_mode = 1;
@@ -836,6 +877,9 @@ main (int argc, char **argv)
             break;
         case 'd':
             seafile_dir = g_strdup(optarg);
+            break;
+        case 'F':
+            central_config_dir = g_strdup(optarg);
             break;
         case 'f':
             daemon_mode = 0;
@@ -918,7 +962,7 @@ main (int argc, char **argv)
         exit (1);
     }
 
-    client = ccnet_init (config_dir);
+    client = ccnet_init (central_config_dir, config_dir);
     if (!client)
         exit (1);
 
@@ -926,10 +970,10 @@ main (int argc, char **argv)
 
     start_rpc_service (client, cloud_mode);
 
-    create_sync_rpc_clients (config_dir);
+    create_sync_rpc_clients (central_config_dir, config_dir);
     create_async_rpc_clients (client);
 
-    seaf = seafile_session_new (seafile_dir, client);
+    seaf = seafile_session_new (central_config_dir, seafile_dir, client);
     if (!seaf) {
         seaf_warning ("Failed to create seafile session.\n");
         exit (1);
@@ -939,15 +983,31 @@ main (int argc, char **argv)
     seaf->async_ccnetrpc_client = async_ccnetrpc_client;
     seaf->ccnetrpc_client_t = ccnetrpc_client_t;
     seaf->async_ccnetrpc_client_t = async_ccnetrpc_client_t;
-    seaf->client_pool = ccnet_client_pool_new (config_dir);
+    seaf->client_pool = ccnet_client_pool_new (central_config_dir, config_dir);
     seaf->cloud_mode = cloud_mode;
 
     load_history_config ();
+
+#ifndef WIN32
+    set_syslog_config (seaf->config);
+#endif
 
     g_free (seafile_dir);
     g_free (logfile);
 
     set_signal_handlers (seaf);
+
+    /* Create pid file before connecting to database.
+     * Connecting to database and creating tables may take long if the db
+     * is on a remote host. This may make controller think seaf-server fails
+     * to start and restart it.
+     */
+    if (pidfile) {
+        if (write_pidfile (pidfile) < 0) {
+            ccnet_message ("Failed to write pidfile\n");
+            return -1;
+        }
+    }
 
     /* init seaf */
     if (seafile_session_init (seaf) < 0)
@@ -956,12 +1016,6 @@ main (int argc, char **argv)
     if (seafile_session_start (seaf) < 0)
         exit (1);
 
-    if (pidfile) {
-        if (write_pidfile (pidfile) < 0) {
-            ccnet_message ("Failed to write pidfile\n");
-            return -1;
-        }
-    }
     atexit (on_seaf_server_exit);
 
     /* Create a system default repo to contain the tutorial file. */

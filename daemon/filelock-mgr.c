@@ -23,6 +23,13 @@ typedef struct _LockInfo {
     int locked_by_me;
 } LockInfo;
 
+/* When a file is locked by me, it can have two reasons:
+ * - Locked by the user manually
+ * - Auto-Locked by Seafile when it detects Office opens the file.
+ */
+#define _LOCKED_MANUAL 1
+#define _LOCKED_AUTO 2
+
 struct _SeafFilelockManager *
 seaf_filelock_manager_new (struct _SeafileSession *session)
 {
@@ -55,8 +62,8 @@ load_locked_files (sqlite3_stmt *stmt, void *data)
     const char *repo_id, *path;
     int locked_by_me;
 
-    repo_id = sqlite3_column_text (stmt, 0);
-    path = sqlite3_column_text (stmt, 1);
+    repo_id = (const char *)sqlite3_column_text (stmt, 0);
+    path = (const char *)sqlite3_column_text (stmt, 1);
     locked_by_me = sqlite3_column_int (stmt, 2);
 
     files = g_hash_table_lookup (repo_locked_files, repo_id);
@@ -200,7 +207,39 @@ seaf_filelock_manager_is_file_locked_by_me (SeafFilelockManager *mgr,
         pthread_mutex_unlock (&mgr->priv->hash_lock);
         return FALSE;
     }
-    ret = info->locked_by_me;
+    ret = (info->locked_by_me > 0);
+
+    pthread_mutex_unlock (&mgr->priv->hash_lock);
+    return ret;
+}
+
+int
+seaf_filelock_manager_get_lock_status (SeafFilelockManager *mgr,
+                                       const char *repo_id,
+                                       const char *path)
+{
+    int ret;
+
+    pthread_mutex_lock (&mgr->priv->hash_lock);
+
+    GHashTable *locks = g_hash_table_lookup (mgr->priv->repo_locked_files, repo_id);
+    if (!locks) {
+        pthread_mutex_unlock (&mgr->priv->hash_lock);
+        return FILE_NOT_LOCKED;
+    }
+
+    LockInfo *info = g_hash_table_lookup (locks, path);
+    if (!info) {
+        pthread_mutex_unlock (&mgr->priv->hash_lock);
+        return FILE_NOT_LOCKED;
+    }
+
+    if (info->locked_by_me == _LOCKED_MANUAL)
+        ret = FILE_LOCKED_BY_ME_MANUAL;
+    else if (info->locked_by_me == _LOCKED_AUTO)
+        ret = FILE_LOCKED_BY_ME_AUTO;
+    else
+        ret = FILE_LOCKED_BY_OTHERS;
 
     pthread_mutex_unlock (&mgr->priv->hash_lock);
     return ret;
@@ -264,7 +303,10 @@ update_in_memory (SeafFilelockManager *mgr, const char *repo_id, GHashTable *new
     GHashTableIter iter;
     gpointer key, value;
     gpointer new_key, new_val;
-    char *path, *fullpath;
+    char *path;
+#ifdef WIN32
+    char *fullpath;
+#endif
     LockInfo *info;
     gboolean exists;
     int locked_by_me;
@@ -520,7 +562,8 @@ refresh_locked_path_status (const char *repo_id, const char *path)
 static int
 mark_file_locked_in_db (SeafFilelockManager *mgr,
                         const char *repo_id,
-                        const char *path)
+                        const char *path,
+                        int locked_by_me)
 {
     char *sql;
     sqlite3_stmt *stmt;
@@ -531,7 +574,7 @@ mark_file_locked_in_db (SeafFilelockManager *mgr,
     stmt = sqlite_query_prepare (mgr->priv->db, sql);
     sqlite3_bind_text (stmt, 1, repo_id, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text (stmt, 2, path, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int (stmt, 2, 1);
+    sqlite3_bind_int (stmt, 3, locked_by_me);
     if (sqlite3_step (stmt) != SQLITE_DONE) {
         seaf_warning ("Failed to update server locked files for %.8s: %s.\n",
                       repo_id, sqlite3_errmsg (mgr->priv->db));
@@ -549,7 +592,8 @@ mark_file_locked_in_db (SeafFilelockManager *mgr,
 int
 seaf_filelock_manager_mark_file_locked (SeafFilelockManager *mgr,
                                         const char *repo_id,
-                                        const char *path)
+                                        const char *path,
+                                        gboolean is_auto_lock)
 {
     GHashTable *locks;
     LockInfo *info;
@@ -567,10 +611,13 @@ seaf_filelock_manager_mark_file_locked (SeafFilelockManager *mgr,
     info = g_hash_table_lookup (locks, path);
     if (!info) {
         info = g_new0 (LockInfo, 1);
-        info->locked_by_me = 1;
         g_hash_table_insert (locks, g_strdup(path), info);
-    } else
-        info->locked_by_me = 1;
+    }
+
+    if (!is_auto_lock)
+        info->locked_by_me = _LOCKED_MANUAL;
+    else
+        info->locked_by_me = _LOCKED_AUTO;
 
     pthread_mutex_unlock (&mgr->priv->hash_lock);
 
@@ -578,7 +625,7 @@ seaf_filelock_manager_mark_file_locked (SeafFilelockManager *mgr,
     refresh_locked_path_status (repo_id, path);
 #endif
 
-    return mark_file_locked_in_db (mgr, repo_id, path);
+    return mark_file_locked_in_db (mgr, repo_id, path, info->locked_by_me);
 }
 
 static int
@@ -615,7 +662,6 @@ seaf_filelock_manager_mark_file_unlocked (SeafFilelockManager *mgr,
                                           const char *path)
 {
     GHashTable *locks;
-    LockInfo *info;
 
     pthread_mutex_lock (&mgr->priv->hash_lock);
 
@@ -634,4 +680,53 @@ seaf_filelock_manager_mark_file_unlocked (SeafFilelockManager *mgr,
 #endif
 
     return remove_locked_file_from_db (mgr, repo_id, path);
+}
+
+void file_lock_info_free (FileLockInfo *info)
+{
+    if (!info)
+        return;
+    g_free (info->path);
+    g_free (info);
+}
+
+static gboolean
+collect_auto_locked_files (sqlite3_stmt *stmt, void *vret)
+{
+    GList **pret = vret;
+    const char *repo_id, *path;
+    FileLockInfo *info;
+
+    repo_id = (const char *)sqlite3_column_text (stmt, 0);
+    path = (const char *)sqlite3_column_text (stmt, 1);
+
+    info = g_new0 (FileLockInfo, 1);
+    memcpy (info->repo_id, repo_id, 36);
+    info->path = g_strdup(path);
+
+    *pret = g_list_prepend (*pret, info);
+
+    return TRUE;
+}
+
+GList *
+seaf_filelock_manager_get_auto_locked_files (SeafFilelockManager *mgr)
+{
+    char *sql;
+    GList *ret = NULL;
+
+    pthread_mutex_lock (&mgr->priv->db_lock);
+
+    sql = sqlite3_mprintf ("SELECT repo_id, path FROM ServerLockedFiles "
+                           "WHERE locked_by_me = %d", _LOCKED_AUTO);
+    sqlite_foreach_selected_row (mgr->priv->db, sql,
+                                 collect_auto_locked_files,
+                                 &ret);
+
+    pthread_mutex_unlock (&mgr->priv->db_lock);
+
+    ret = g_list_reverse (ret);
+
+    sqlite3_free (sql);
+    return ret;
 }

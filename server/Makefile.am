@@ -24,7 +24,6 @@ proc_headers = $(addprefix processors/, \
 	recvbranch-proc.h \
 	putcs-proc.h \
 	sync-repo-slave-proc.h \
-	check-tx-slave-v2-proc.h \
 	check-tx-slave-v3-proc.h \
 	putfs-proc.h \
 	putcommit-v2-proc.h \
@@ -46,7 +45,6 @@ noinst_HEADERS = web-accesstoken-mgr.h chunkserv-mgr.h seafile-session.h \
 	passwd-mgr.h \
 	quota-mgr.h \
 	listen-mgr.h \
-	monitor-rpc-wrappers.h \
 	../common/mq-mgr.h \
 	size-sched.h \
 	block-tx-server.h \
@@ -57,11 +55,13 @@ noinst_HEADERS = web-accesstoken-mgr.h chunkserv-mgr.h seafile-session.h \
 	pack-dir.h \
 	fileserver-config.h \
 	http-status-codes.h \
+	zip-download-mgr.h \
 	$(proc_headers)
 
 seaf_server_SOURCES = \
 	seaf-server.c \
 	web-accesstoken-mgr.c chunkserv-mgr.c seafile-session.c \
+	zip-download-mgr.c \
 	share-mgr.c \
 	token-mgr.c \
 	passwd-mgr.c \
@@ -77,7 +77,7 @@ seaf_server_SOURCES = \
 	access-file.c \
 	pack-dir.c \
 	fileserver-config.c \
-	monitor-rpc-wrappers.c ../common/seaf-db.c \
+	../common/seaf-db.c \
 	../common/branch-mgr.c ../common/fs-mgr.c \
 	repo-mgr.c ../common/commit-mgr.c \
 	../common/log.c ../common/object-list.c \
@@ -99,7 +99,6 @@ seaf_server_SOURCES = \
 	processors/recvbranch-proc.c \
 	processors/putcs-proc.c \
 	processors/sync-repo-slave-proc.c \
-	processors/check-tx-slave-v2-proc.c \
 	processors/check-tx-slave-v3-proc.c \
 	processors/putfs-proc.c \
 	processors/putcommit-v2-proc.c \
@@ -119,6 +118,6 @@ seaf_server_LDADD = @CCNET_LIBS@ \
 	@GLIB2_LIBS@ @GOBJECT_LIBS@ @SSL_LIBS@ @LIB_RT@ @LIB_UUID@ -lsqlite3 @LIBEVENT_LIBS@ -levhtp \
 	$(top_builddir)/common/cdc/libcdc.la \
 	@SEARPC_LIBS@ @JANSSON_LIBS@ @ZDB_LIBS@ @CURL_LIBS@ ${LIB_WS32} @ZLIB_LIBS@ \
-	@LIBARCHIVE_LIBS@
+	@LIBARCHIVE_LIBS@ @LIB_ICONV@
 
 seaf_server_LDFLAGS = @STATIC_COMPILE@ @SERVER_PKG_RPATH@

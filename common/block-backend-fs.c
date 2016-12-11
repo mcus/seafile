@@ -337,7 +337,7 @@ block_backend_fs_copy (BlockBackend *bend,
 
 #ifdef WIN32
     if (!CreateHardLink (dst_path, src_path, NULL)) {
-        seaf_warning ("Failed to link %s to %s: %d.\n",
+        seaf_warning ("Failed to link %s to %s: %lu.\n",
                       src_path, dst_path, GetLastError());
         return -1;
     }
@@ -378,6 +378,7 @@ block_backend_fs_remove_store (BlockBackend *bend, const char *store_id)
             seaf_warning ("Failed to open block dir %s.\n", path1);
             g_dir_close (dir1);
             g_free (path1);
+            g_free (block_dir);
             return -1;
         }
 

@@ -21,8 +21,6 @@
 
 #include "seafile-session.h"
 
-#include "monitor-rpc-wrappers.h"
-
 #include "seaf-db.h"
 #include "seaf-utils.h"
 
@@ -37,9 +35,11 @@ static int
 load_thread_pool_config (SeafileSession *session);
 
 SeafileSession *
-seafile_session_new(const char *seafile_dir,
+seafile_session_new(const char *central_config_dir,
+                    const char *seafile_dir,
                     CcnetClient *ccnet_session)
 {
+    char *abs_central_config_dir = NULL;
     char *abs_seafile_dir;
     char *tmp_file_dir;
     char *config_file_path;
@@ -51,7 +51,12 @@ seafile_session_new(const char *seafile_dir,
 
     abs_seafile_dir = ccnet_expand_path (seafile_dir);
     tmp_file_dir = g_build_filename (abs_seafile_dir, "tmpfiles", NULL);
-    config_file_path = g_build_filename (abs_seafile_dir, "seafile.conf", NULL);
+    if (central_config_dir) {
+        abs_central_config_dir = ccnet_expand_path (central_config_dir);
+    }
+    config_file_path = g_build_filename(
+        abs_central_config_dir ? abs_central_config_dir : abs_seafile_dir,
+        "seafile.conf", NULL);
 
     if (checkdir_with_mkdir (abs_seafile_dir) < 0) {
         seaf_warning ("Config dir %s does not exist and is unable to create\n",
@@ -73,6 +78,7 @@ seafile_session_new(const char *seafile_dir,
         g_key_file_free (config);
         goto onerror;
     }
+    g_free (config_file_path);
 
     session = g_new0(SeafileSession, 1);
     session->seaf_dir = abs_seafile_dir;
@@ -153,6 +159,10 @@ seafile_session_new(const char *seafile_dir,
 
     session->http_server = seaf_http_server_new (session);
     if (!session->http_server)
+        goto onerror;
+
+    session->zip_download_mgr = zip_download_mgr_new ();
+    if (!session->zip_download_mgr)
         goto onerror;
 
     return session;
@@ -288,6 +298,13 @@ set_system_default_repo_id (SeafileSession *session, const char *repo_id)
     return seaf_db_query (session->db, sql);
 }
 
+static int
+del_system_default_repo_id (SeafileSession *session)
+{
+    const char *sql = "DELETE FROM SystemInfo WHERE info_key='default_repo_id'";
+    return seaf_db_query (session->db, sql);
+}
+
 #define DEFAULT_TEMPLATE_DIR "library-template"
 
 static void
@@ -357,10 +374,22 @@ create_system_default_repo (void *data)
     char *repo_id;
     char *template_path;
 
-    /* If it already exists, don't need to create. */
+    /* If default repo is not set or doesn't exist, create a new one. */
     repo_id = get_system_default_repo_id (session);
-    if (repo_id != NULL)
-        return data;
+    if (repo_id != NULL) {
+        SeafRepo *repo;
+        repo = seaf_repo_manager_get_repo (session->repo_mgr, repo_id);
+        if (!repo) {
+            seaf_warning ("Failed to get system default repo. Create a new one.\n");
+            del_system_default_repo_id (session);
+            seaf_repo_manager_del_repo (session->repo_mgr, repo_id, NULL);
+            g_free (repo_id);
+        } else {
+            seaf_repo_unref (repo);
+            g_free (repo_id);
+            return data;
+        }
+    }
 
     repo_id = seaf_repo_manager_create_new_repo (session->repo_mgr,
                                                  "My Library Template",

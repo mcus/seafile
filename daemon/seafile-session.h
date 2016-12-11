@@ -45,6 +45,8 @@ struct _SeafileSession {
 
     struct _CcnetClient *session;
 
+    char                *client_name;
+
     SearpcClient        *ccnetrpc_client;
     SearpcClient        *appletrpc_client;
 
@@ -53,6 +55,7 @@ struct _SeafileSession {
     char                *worktree_dir; /* the default directory for
                                         * storing worktrees  */
     sqlite3             *config_db;
+    char                *deleted_store;
 
     SeafBlockManager    *block_mgr;
     SeafFSManager       *fs_mgr;

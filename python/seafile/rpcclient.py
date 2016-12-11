@@ -275,6 +275,11 @@ class SeafServerRpcClient(ccnet.RpcClientBase):
         pass
     web_query_access_token = seafile_web_query_access_token
 
+    @searpc_func("string", ["string"])
+    def seafile_query_zip_progress(token):
+        pass
+    query_zip_progress = seafile_query_zip_progress
+
     ###### GC    ####################
     @searpc_func("int", [])
     def seafile_gc():
@@ -370,8 +375,8 @@ class SeafServerThreadedRpcClient(ccnet.RpcClientBase):
         pass
     get_orphan_repo_list = seafile_get_orphan_repo_list
 
-    @searpc_func("objlist", ["string"])
-    def seafile_list_owned_repos(user_id):
+    @searpc_func("objlist", ["string", "int"])
+    def seafile_list_owned_repos(user_id, ret_corrupted):
         pass
     list_owned_repos = seafile_list_owned_repos
 
@@ -430,8 +435,8 @@ class SeafServerThreadedRpcClient(ccnet.RpcClientBase):
         pass
     copy_file = seafile_copy_file
 
-    @searpc_func("object", ["string", "string", "string", "string", "string", "string", "string", "int", "int"])
-    def seafile_move_file(src_repo, src_dir, src_filename, dst_repo, dst_dir, dst_filename, user, need_progress, synchronous):
+    @searpc_func("object", ["string", "string", "string", "string", "string", "string", "int", "string", "int", "int"])
+    def seafile_move_file(src_repo, src_dir, src_filename, dst_repo, dst_dir, dst_filename, replace, user, need_progress, synchronous):
         pass
     move_file = seafile_move_file
 
@@ -451,9 +456,9 @@ class SeafServerThreadedRpcClient(ccnet.RpcClientBase):
     get_commit = seafile_get_commit
 
     @searpc_func("string", ["string", "string", "int", "int"])
-    def seafile_list_file(repo_id, file_id, offset, limit):
+    def seafile_list_file_blocks(repo_id, file_id, offset, limit):
         pass
-    list_file = seafile_list_file
+    list_file_blocks = seafile_list_file_blocks
 
     @searpc_func("objlist", ["string", "string", "int", "int"])
     def seafile_list_dir(repo_id, dir_id, offset, limit):
@@ -480,9 +485,9 @@ class SeafServerThreadedRpcClient(ccnet.RpcClientBase):
     list_dir_by_path = seafile_list_dir_by_path
 
     @searpc_func("string", ["string", "string", "string"])
-    def seafile_get_dirid_by_path(repo_id, commit_id, path):
+    def seafile_get_dir_id_by_commit_and_path(repo_id, commit_id, path):
         pass
-    get_dirid_by_path = seafile_get_dirid_by_path
+    get_dir_id_by_commit_and_path = seafile_get_dir_id_by_commit_and_path
 
     @searpc_func("string", ["string", "string"])
     def seafile_get_file_id_by_path(repo_id, path):
@@ -519,13 +524,18 @@ class SeafServerThreadedRpcClient(ccnet.RpcClientBase):
         pass
     revert_file = seafile_revert_file
 
+    @searpc_func("string", ["string", "string"])
+    def seafile_check_repo_blocks_missing(repo_id, blklist):
+        pass
+    check_repo_blocks_missing = seafile_check_repo_blocks_missing
+
     @searpc_func("int", ["string", "string", "string", "string"])
     def seafile_revert_dir(repo_id, commit_id, path, user):
         pass
     revert_dir = seafile_revert_dir
 
-    @searpc_func("objlist", ["string", "int", "string"])
-    def get_deleted(repo_id, show_days, path):
+    @searpc_func("objlist", ["string", "int", "string", "string", "int"])
+    def get_deleted(repo_id, show_days, path, scan_stat, limit):
         pass
 
     # share repo to user
@@ -543,6 +553,18 @@ class SeafServerThreadedRpcClient(ccnet.RpcClientBase):
     def seafile_list_repo_shared_to(from_user, repo_id):
         pass
     list_repo_shared_to = seafile_list_repo_shared_to
+
+    @searpc_func("int", ["string", "string", "string", "string", "string", "string"])
+    def share_subdir_to_user(repo_id, path, owner, share_user, permission, passwd):
+        pass
+
+    @searpc_func("int", ["string", "string", "string", "string"])
+    def unshare_subdir_for_user(repo_id, path, owner, share_user):
+        pass
+
+    @searpc_func("int", ["string", "string", "string", "string", "string"])
+    def update_share_subdir_perm_for_user(repo_id, path, owner, share_user, permission):
+        pass
 
     @searpc_func("objlist", ["int", "string", "string", "int", "int"])
     def seafile_list_org_share_repos(org_id, email, query_col, start, limit):
@@ -588,6 +610,18 @@ class SeafServerThreadedRpcClient(ccnet.RpcClientBase):
     def seafile_get_shared_groups_for_subdir(repo_id, path, from_user):
         pass
     get_shared_groups_for_subdir = seafile_get_shared_groups_for_subdir
+
+    @searpc_func("int", ["string", "string", "string", "int", "string", "string"])
+    def share_subdir_to_group(repo_id, path, owner, share_group, permission, passwd):
+        pass
+
+    @searpc_func("int", ["string", "string", "string", "int"])
+    def unshare_subdir_for_group(repo_id, path, owner, share_group):
+        pass
+
+    @searpc_func("int", ["string", "string", "string", "int", "string"])
+    def update_share_subdir_perm_for_group(repo_id, path, owner, share_group, permission):
+        pass
 
     @searpc_func("string", ["int"])
     def seafile_get_group_repoids(group_id):

@@ -16,6 +16,10 @@
 #include <glib.h>
 #include <glib-object.h>
 
+#ifdef HAVE_BREAKPAD_SUPPORT
+#include <c_bpwrapper.h>
+#endif // HAVE_BREAKPAD_SUPPORT
+
 #include <ccnet.h>
 #include <searpc-server.h>
 #include <searpc-client.h>
@@ -23,12 +27,12 @@
 #include "seafile-session.h"
 #include "seafile-rpc.h"
 #include <ccnet/rpcserver-proc.h>
+#include <ccnet/threaded-rpcserver-proc.h>
 #include "log.h"
 #include "utils.h"
 #include "vc-utils.h"
 #include "seafile-config.h"
-
-#include "processors/check-tx-slave-proc.h"
+#include "curl-init.h"
 
 #include "cdc/cdc.h"
 
@@ -75,10 +79,9 @@ start_rpc_service (CcnetClient *client)
     ccnet_register_service (client, "seafile-rpcserver", "rpc-inner",
                             CCNET_TYPE_RPCSERVER_PROC, NULL);
 
-    /* searpc_create_service ("seafile-threaded-rpcserver"); */
-    /* ccnet_register_service (client, "seafile-threaded-rpcserver", "rpc-inner", */
-    /*                         CCNET_TYPE_THREADED_RPCSERVER_PROC, */
-    /*                         seafile_register_service_cb); */
+    searpc_create_service ("seafile-threaded-rpcserver");
+    ccnet_register_service (client, "seafile-threaded-rpcserver", "rpc-inner",
+                            CCNET_TYPE_THREADED_RPCSERVER_PROC, NULL);
 
     /* seafile-rpcserver */
     searpc_server_register_function ("seafile-rpcserver",
@@ -291,6 +294,22 @@ start_rpc_service (CcnetClient *client)
                                      seafile_generate_magic_and_random_key,
                                      "seafile_generate_magic_and_random_key",
                                      searpc_signature_object__int_string_string());
+
+    searpc_server_register_function ("seafile-rpcserver",
+                                     seafile_get_server_property,
+                                     "seafile_get_server_property",
+                                     searpc_signature_string__string_string());
+
+    searpc_server_register_function ("seafile-rpcserver",
+                                     seafile_set_server_property,
+                                     "seafile_set_server_property",
+                                     searpc_signature_int__string_string_string());
+
+    /* Need to run in a thread since diff may take long. */
+    searpc_server_register_function ("seafile-threaded-rpcserver",
+                                     seafile_diff,
+                                     "seafile_diff",
+                                     searpc_signature_objlist__string_string_string_int());
 }
 
 static void
@@ -308,7 +327,7 @@ create_sync_rpc_clients (const char *config_dir)
 
     /* sync client and rpc client */
     sync_client = ccnet_client_new ();
-    if ( (ccnet_client_load_confdir(sync_client, config_dir)) < 0 ) {
+    if ( (ccnet_client_load_confdir(sync_client, NULL, config_dir)) < 0 ) {
         seaf_warning ("Read config dir error\n");
         exit(1);
     }
@@ -358,7 +377,7 @@ bind_ccnet_service (const char *config_dir)
     gboolean ret = TRUE;
 
     bind_client = ccnet_client_new ();
-    if ( (ccnet_client_load_confdir(bind_client, config_dir)) < 0 ) {
+    if ( (ccnet_client_load_confdir(bind_client, NULL, config_dir)) < 0 ) {
         seaf_warning ("Read config dir error\n");
         exit(1);
     }
@@ -380,6 +399,16 @@ bind_ccnet_service (const char *config_dir)
 int
 main (int argc, char **argv)
 {
+#ifdef HAVE_BREAKPAD_SUPPORT
+#ifdef WIN32
+#define DUMPS_DIR "~/ccnet/logs/dumps/"
+#else
+#define DUMPS_DIR "~/.ccnet/logs/dumps/"
+#endif
+    const char *dump_dir = ccnet_expand_path(DUMPS_DIR);
+    checkdir_with_mkdir(dump_dir);
+    CBPWrapperExceptionHandler bp_exception_handler = newCBPWrapperExceptionHandler(dump_dir);
+#endif
     int c;
     char *config_dir = DEFAULT_CONFIG_DIR;
     char *seafile_dir = NULL;
@@ -492,7 +521,7 @@ main (int argc, char **argv)
     }
 
     /* init ccnet */
-    client = ccnet_init (config_dir);
+    client = ccnet_init (NULL, config_dir);
     if (!client)
         exit (1);
 
@@ -527,11 +556,13 @@ main (int argc, char **argv)
 
     set_signal_handlers (seaf);
 
+    seafile_curl_init();
     seafile_session_prepare (seaf);
     seafile_session_start (seaf);
 
     seafile_session_config_set_string (seaf, "wktree", seaf->worktree_dir);
     ccnet_main (client);
+    seafile_curl_deinit();
 
     return 0;
 }

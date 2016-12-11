@@ -28,6 +28,8 @@ struct _SeafCommit {
     char       *repo_name;
     char       *repo_desc;
     char       *repo_category;
+    char       *device_name;
+    char       *client_version;
 
     gboolean    encrypted;         
     int         enc_version;
@@ -185,5 +187,9 @@ seaf_commit_manager_commit_exists (SeafCommitManager *mgr,
                                    const char *repo_id,
                                    int version,
                                    const char *id);
+
+int
+seaf_commit_manager_remove_store (SeafCommitManager *mgr,
+                                  const char *store_id);
 
 #endif

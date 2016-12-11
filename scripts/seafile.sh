@@ -16,7 +16,7 @@ SCRIPT=$(readlink -f "$0")
 INSTALLPATH=$(dirname "${SCRIPT}")
 TOPDIR=$(dirname "${INSTALLPATH}")
 default_ccnet_conf_dir=${TOPDIR}/ccnet
-ccnet_pidfile=${INSTALLPATH}/runtime/ccnet.pid
+central_config_dir=${TOPDIR}/conf
 seaf_controller="${INSTALLPATH}/seafile/bin/seafile-controller"
 
 
@@ -37,9 +37,29 @@ if [[ $# != 1 || ( "$1" != "start" && "$1" != "stop" && "$1" != "restart" ) ]]; 
     exit 1;
 fi
 
+function validate_running_user () {
+    real_data_dir=`readlink -f ${seafile_data_dir}`
+    running_user=`id -un`
+    data_dir_owner=`stat -c %U ${real_data_dir}`
+
+    if [[ "${running_user}" != "${data_dir_owner}" ]]; then
+        echo "Error: the user running the script (\"${running_user}\") is not the owner of \"${real_data_dir}\" folder, you should use the user \"${data_dir_owner}\" to run the script."
+        exit -1;
+    fi
+}
+
 function validate_ccnet_conf_dir () {
     if [[ ! -d ${default_ccnet_conf_dir} ]]; then
         echo "Error: there is no ccnet config directory."
+        echo "Have you run setup-seafile.sh before this?"
+        echo ""
+        exit -1;
+    fi
+}
+
+function validate_central_conf_dir () {
+    if [[ ! -d ${central_config_dir} ]]; then
+        echo "Error: there is no conf/ directory."
         echo "Have you run setup-seafile.sh before this?"
         echo ""
         exit -1;
@@ -62,7 +82,10 @@ function read_seafile_data_dir () {
 }
 
 function test_config() {
-    if ! LD_LIBRARY_PATH=$SEAFILE_LD_LIBRARY_PATH ${seaf_controller} --test -c "${default_ccnet_conf_dir}" -d "${seafile_data_dir}"; then
+    if ! LD_LIBRARY_PATH=$SEAFILE_LD_LIBRARY_PATH ${seaf_controller} --test \
+         -c "${default_ccnet_conf_dir}" \
+         -d "${seafile_data_dir}" \
+         -F "${central_config_dir}" ; then
         exit 1;
     fi
 }
@@ -96,13 +119,19 @@ function validate_already_running () {
 
 function start_seafile_server () {
     validate_already_running;
+    validate_central_conf_dir;
     validate_ccnet_conf_dir;
     read_seafile_data_dir;
+    validate_running_user;
     test_config;
 
     echo "Starting seafile server, please wait ..."
 
-    LD_LIBRARY_PATH=$SEAFILE_LD_LIBRARY_PATH ${seaf_controller} -c "${default_ccnet_conf_dir}" -d "${seafile_data_dir}"
+    mkdir -p $TOPDIR/logs
+    LD_LIBRARY_PATH=$SEAFILE_LD_LIBRARY_PATH ${seaf_controller} \
+                   -c "${default_ccnet_conf_dir}" \
+                   -d "${seafile_data_dir}" \
+                   -F "${central_config_dir}"
 
     sleep 3
 

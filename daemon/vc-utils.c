@@ -413,6 +413,11 @@ case_conflict_exists (const char *dir_path, const char *new_dname,
     gboolean is_case_conflict = FALSE;
     GError *error = NULL;
 
+    /* Don't generate "case conflict" files for a case-conflicted file. */
+    if (strstr (new_dname, "case conflict") != NULL) {
+        return is_case_conflict;
+    }
+
     dir = g_dir_open (dir_path, 0, &error);
     if (!dir && error) {
         seaf_warning ("Failed to open dir %s: %s.\n", dir_path, error->message);
@@ -469,9 +474,16 @@ static gboolean
 case_conflict_exists (const char *dir_path, const char *new_dname,
                       char **conflict_dname)
 {
-    wchar_t *dir_path_w = win32_long_path (dir_path);
+    wchar_t *dir_path_w;
     gboolean is_case_conflict = FALSE;
     CaseConflictData data;
+
+    /* Don't generate "case conflict" files for a case-conflicted file. */
+    if (strstr (new_dname, "case conflict") != NULL) {
+        return is_case_conflict;
+    }
+
+    dir_path_w = win32_long_path (dir_path);
 
     memset (&data, 0, sizeof(data));
     data.new_dname = new_dname;
@@ -493,6 +505,10 @@ out:
  * If files "test (case conflict 1).txt" and "Test (case conflict 2).txt" exist,
  * and we have to checkout "TEST.txt", it will be checked out to "TEST
  * (case conflict 3).txt".
+ * To prevent generating too many case conflict files (in case of bug or other
+ * reasons), no more than 10 case conflict files will be generated for the same
+ * filename. After that, all later confilcted files will use the last conflict
+ * file name.
  */
 static char *
 gen_case_conflict_free_dname (const char *dir_path, const char *dname)
@@ -505,7 +521,7 @@ gen_case_conflict_free_dname (const char *dir_path, const char *dname)
 
     dot = strrchr (copy, '.');
 
-    while (cnt < 255) {
+    while (cnt < 11) {
         if (dot != NULL) {
             *dot = '\0';
             ext = dot + 1;
@@ -664,8 +680,6 @@ error:
 
 #endif  /* defined WIN32 || defined __APPLE__ */
 
-#ifdef __linux__
-
 char *
 build_checkout_path (const char *worktree, const char *ce_name, int len)
 {
@@ -706,8 +720,6 @@ build_checkout_path (const char *worktree, const char *ce_name, int len)
 
     return g_strdup(path);
 }
-
-#endif  /* __linux__ */
 
 static int
 checkout_entry (struct cache_entry *ce,
@@ -930,12 +942,19 @@ delete_path (const char *worktree, const char *name,
 #ifdef WIN32
 
 static gboolean
-check_file_locked (const wchar_t *path_w)
+check_file_locked (const wchar_t *path_w, gboolean locked_on_server)
 {
     HANDLE handle;
+    /* If the file is locked on server, its local access right has been set to
+     * read-only. So trying to test GENERIC_WRITE access will certainly return
+     * ACCESS_DENIED. In this case, we can only test for GENERIC_READ.
+     * MS Office seems to gain exclusive read/write access to the file. So even
+     * trying read access can return a SHARING_VIOLATION error.
+     */
+    DWORD access_mode = locked_on_server ? GENERIC_READ : GENERIC_WRITE;
 
     handle = CreateFileW (path_w,
-                          GENERIC_WRITE,
+                          access_mode,
                           0,
                           NULL,
                           OPEN_EXISTING,
@@ -951,14 +970,14 @@ check_file_locked (const wchar_t *path_w)
 }
 
 gboolean
-do_check_file_locked (const char *path, const char *worktree)
+do_check_file_locked (const char *path, const char *worktree, gboolean locked_on_server)
 {
     char *real_path;
     wchar_t *real_path_w;
     gboolean ret;
     real_path = g_build_path(PATH_SEPERATOR, worktree, path, NULL);
     real_path_w = win32_long_path (real_path);
-    ret = check_file_locked (real_path_w);
+    ret = check_file_locked (real_path_w, locked_on_server);
     g_free (real_path);
     g_free (real_path_w);
     return ret;
@@ -992,7 +1011,7 @@ check_dir_locked_recursive (const wchar_t *path_w)
     HANDLE handle;
     wchar_t *pattern;
     wchar_t *sub_path_w;
-    char *path, *sub_path;
+    char *path;
     int path_len_w;
     DWORD error;
     gboolean ret = FALSE;
@@ -1032,7 +1051,7 @@ check_dir_locked_recursive (const wchar_t *path_w)
                 goto out;
             }
         } else {
-            if (check_file_locked (sub_path_w)) {
+            if (check_file_locked (sub_path_w, FALSE)) {
                 ret = TRUE;
                 g_free (sub_path_w);
                 goto out;
@@ -1048,9 +1067,8 @@ check_dir_locked_recursive (const wchar_t *path_w)
                       path, error);
     }
 
-    FindClose (handle);
-
 out:
+    FindClose (handle);
     g_free (path);
     g_free (pattern);
     return ret;
@@ -1099,13 +1117,13 @@ files_locked_on_windows (struct index_state *index, const char *worktree)
                 mask == 6 ||    /* both added */
                 mask == 3)      /* others removed */
             {
-                if (do_check_file_locked (ce->name, worktree))
+                if (do_check_file_locked (ce->name, worktree, FALSE))
                     ret = TRUE;
                     break;
             }
         } else if (ce->ce_flags & CE_UPDATE ||
                    ce->ce_flags & CE_WT_REMOVE) {
-            if (do_check_file_locked (ce->name, worktree)) {
+            if (do_check_file_locked (ce->name, worktree, FALSE)) {
                 ret = TRUE;
                 break;
             }

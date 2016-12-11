@@ -223,6 +223,15 @@ seafile_mark_file_locked (const char *repo_id, const char *path, GError **error)
 int
 seafile_mark_file_unlocked (const char *repo_id, const char *path, GError **error);
 
+char *
+seafile_get_server_property (const char *server_url, const char *key, GError **error);
+
+int
+seafile_set_server_property (const char *server_url,
+                             const char *key,
+                             const char *value,
+                             GError **error);
+
 /**
  * seafile_list_dir:
  * List a directory.
@@ -235,15 +244,17 @@ GList * seafile_list_dir (const char *repo_id,
                           const char *dir_id, int offset, int limit, GError **error);
 
 /**
- * seafile_list_file:
+ * seafile_list_file_blocks:
  * List the blocks of a file.
  *
  * Returns: a list of block ids speprated by '\n'.
  * 
  * @limit: if limit <= 0, all blocks start from @offset will be returned.
  */
-char * seafile_list_file (const char *repo_id,
-                          const char *file_id, int offset, int limit, GError **error);
+char * seafile_list_file_blocks (const char *repo_id,
+                                 const char *file_id,
+                                 int offset, int limit,
+                                 GError **error);
 
 /**
  * seafile_list_dir_by_path:
@@ -255,13 +266,15 @@ GList * seafile_list_dir_by_path (const char *repo_id,
                                   const char *commit_id, const char *path, GError **error);
 
 /**
- * seafile_get_dirid_by_path:
+ * seafile_get_dir_id_by_commit_and_path:
  * Get the dir_id of the path
  *
  * Returns: the dir_id of the path
  */
-char * seafile_get_dirid_by_path (const char *repo_id,
-                                  const char *commit_id, const char *path, GError **error);
+char * seafile_get_dir_id_by_commit_and_path (const char *repo_id,
+                                              const char *commit_id,
+                                              const char *path,
+                                              GError **error);
 
 /**
  * seafile_revert:
@@ -433,7 +446,7 @@ GList *
 seafile_get_orphan_repo_list(GError **error);
 
 GList *
-seafile_list_owned_repos (const char *email, GError **error);
+seafile_list_owned_repos (const char *email, int ret_corrupted, GError **error);
 
 /**
  * seafile_add_chunk_server:
@@ -483,11 +496,38 @@ seafile_web_get_access_token (const char *repo_id,
 GObject *
 seafile_web_query_access_token (const char *token, GError **error);
 
+char *
+seafile_query_zip_progress (const char *token, GError **error);
+
 GObject *
 seafile_get_checkout_task (const char *repo_id, GError **error);
 
 GList *
 seafile_get_sync_task_list (GError **error);
+
+int
+seafile_share_subdir_to_user (const char *repo_id,
+                              const char *path,
+                              const char *owner,
+                              const char *share_user,
+                              const char *permission,
+                              const char *passwd,
+                              GError **error);
+
+int
+seafile_unshare_subdir_for_user (const char *repo_id,
+                                 const char *path,
+                                 const char *owner,
+                                 const char *share_user,
+                                 GError **error);
+
+int
+seafile_update_share_subdir_perm_for_user (const char *repo_id,
+                                           const char *path,
+                                           const char *owner,
+                                           const char *share_user,
+                                           const char *permission,
+                                           GError **error);
 
 int
 seafile_add_share (const char *repo_id, const char *from_email,
@@ -509,6 +549,30 @@ seafile_list_repo_shared_group (const char *from_user, const char *repo_id,
 int
 seafile_remove_share (const char *repo_id, const char *from_email,
                       const char *to_email, GError **error);
+
+int
+seafile_share_subdir_to_group (const char *repo_id,
+                               const char *path,
+                               const char *owner,
+                               int share_group,
+                               const char *permission,
+                               const char *passwd,
+                               GError **error);
+
+int
+seafile_unshare_subdir_for_group (const char *repo_id,
+                                  const char *path,
+                                  const char *owner,
+                                  int share_group,
+                                  GError **error);
+
+int
+seafile_update_share_subdir_perm_for_group (const char *repo_id,
+                                            const char *path,
+                                            const char *owner,
+                                            int share_group,
+                                            const char *permission,
+                                            GError **error);
 
 int
 seafile_group_share_repo (const char *repo_id, int group_id,
@@ -702,6 +766,7 @@ seafile_move_file (const char *src_repo_id,
                    const char *dst_repo_id,
                    const char *dst_dir,
                    const char *dst_filename,
+                   int replace,
                    const char *user,
                    int need_progress,
                    int synchronous,
@@ -783,12 +848,18 @@ seafile_revert_dir (const char *repo_id,
                     const char *user,
                     GError **error);
 
+char *
+seafile_check_repo_blocks_missing (const char *repo_id,
+                                   const char *blockids_json,
+                                   GError **error);
+
 /*
  * @show_days: return deleted files in how many days, return all if 0.
  */
 GList *
 seafile_get_deleted (const char *repo_id, int show_days,
-                     const char *path, GError **error);
+                     const char *path, const char *scan_stat,
+                     int limit, GError **error);
 
 /**
  * Generate a new token for (repo_id, email) and return it

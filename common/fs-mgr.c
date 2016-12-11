@@ -21,6 +21,7 @@
 #include "block-mgr.h"
 #include "utils.h"
 #include "seaf-utils.h"
+#define DEBUG_FLAG SEAFILE_DEBUG_OTHER
 #include "log.h"
 #include "../common/seafile-crypt.h"
 
@@ -30,8 +31,6 @@
 #endif  /* SEAFILE_SERVER */
 
 #include "db.h"
-
-#define SEAF_TMP_EXT "~"
 
 struct _SeafFSManagerPriv {
     /* GHashTable      *seafile_cache; */
@@ -222,6 +221,16 @@ checkout_blk_error:
     return -1;
 }
 
+#define SEAF_TMP_EXT "~"
+#define SEAF_BACKUP_EXT ".sbak"
+
+/*
+ * File updating procedure:
+ * 1. Checkout server versioin to tmp file.
+ * 2. If there is a local version, move it to a backup file.
+ * 3. Rename the tmp file to the destination path.
+ * 4. Remove the backup file if exists.
+ */
 int
 seaf_fs_manager_checkout_file (SeafFSManager *mgr,
                                const char *repo_id,
@@ -237,14 +246,17 @@ seaf_fs_manager_checkout_file (SeafFSManager *mgr,
                                gboolean *conflicted,
                                const char *email)
 {
-    Seafile *seafile;
+    Seafile *seafile = NULL;
     char *blk_id;
-    int wfd;
+    int wfd = -1;
     int i;
-    char *tmp_path;
-    char *conflict_path;
+    char *tmp_path = NULL;
+    char *backup_path = NULL;
+    char *conflict_path = NULL;
 
     *conflicted = FALSE;
+
+    /* Check out server version to tmp file. */
 
     seafile = seaf_fs_manager_get_seafile (mgr, repo_id, version, file_id);
     if (!seafile) {
@@ -272,7 +284,62 @@ seaf_fs_manager_checkout_file (SeafFSManager *mgr,
     close (wfd);
     wfd = -1;
 
-    if (force_conflict || seaf_util_rename (tmp_path, file_path) < 0) {
+    /* Move existing file to backup file. */
+
+    backup_path = g_strconcat (file_path, SEAF_BACKUP_EXT, NULL);
+
+    if (seaf_util_exists (file_path) &&
+        seaf_util_rename (file_path, backup_path) < 0) {
+        seaf_warning ("Failed to rename %s to %s: %s. "
+                      "Checkout server version as conflict file.\n",
+                      file_path, backup_path, strerror(errno));
+
+        *conflicted = TRUE;
+
+        conflict_path = gen_conflict_path_wrapper (repo_id, version,
+                                                   conflict_head_id, in_repo_path,
+                                                   file_path);
+        if (!conflict_path)
+            goto bad;
+
+        if (seaf_util_rename (tmp_path, conflict_path) < 0) {
+            goto bad;
+        }
+
+        goto out;
+    }
+
+    /* Now that the old existing file has been renamed to backup file,
+     * this rename operation usually succeeds.
+     */
+    if (seaf_util_rename (tmp_path, file_path) < 0) {
+        seaf_warning ("Failed to rename %s to %s: %s. "
+                      "Checkout server version as conflict file.\n",
+                      tmp_path, file_path, strerror(errno));
+
+        *conflicted = TRUE;
+
+        /* Restore the existing file. */
+        if (seaf_util_rename (backup_path, file_path) < 0) {
+            seaf_warning ("Failed to rename %s to %s: %s. "
+                          "Failed to restore backup file.\n",
+                          backup_path, file_path, strerror(errno));
+        }
+
+        conflict_path = gen_conflict_path_wrapper (repo_id, version,
+                                                   conflict_head_id, in_repo_path,
+                                                   file_path);
+        if (!conflict_path)
+            goto bad;
+
+        if (seaf_util_rename (tmp_path, conflict_path) < 0) {
+            goto bad;
+        }
+
+        goto out;
+    }
+
+    if (force_conflict) {
         *conflicted = TRUE;
 
         /* XXX
@@ -296,34 +363,12 @@ seaf_fs_manager_checkout_file (SeafFSManager *mgr,
 
         conflict_path = gen_conflict_path (file_path, suffix, (gint64)time(NULL));
 
-        seaf_warning ("Cannot update %s, creating conflict file %s.\n",
-                      file_path, conflict_path);
-
-        /* First try to rename the local version to a conflict file,
-         * this will preserve the version from the server.
-         * If this fails, fall back to checking out the server version
-         * to the conflict file.
-         */
-        if (seaf_util_rename (file_path, conflict_path) == 0) {
-            if (seaf_util_rename (tmp_path, file_path) < 0) {
-                g_free (conflict_path);
-                goto bad;
-            }
-        } else {
-            g_free (conflict_path);
-            conflict_path = gen_conflict_path_wrapper (repo_id, version,
-                                                       conflict_head_id, in_repo_path,
-                                                       file_path);
-            if (!conflict_path)
-                goto bad;
-
-            if (seaf_util_rename (tmp_path, conflict_path) < 0) {
-                g_free (conflict_path);
-                goto bad;
-            }
+        if (seaf_util_exists (backup_path) &&
+            seaf_util_rename (backup_path, conflict_path) < 0) {
+            seaf_warning ("Failed to rename %s to %s: %s. "
+                          "Failed to move backup file to conflict file.\n",
+                          backup_path, conflict_path, strerror(errno));
         }
-
-        g_free (conflict_path);
     }
 
     if (mtime > 0) {
@@ -335,7 +380,12 @@ seaf_fs_manager_checkout_file (SeafFSManager *mgr,
         }
     }
 
+    seaf_util_unlink (backup_path);
+
+out:
     g_free (tmp_path);
+    g_free (backup_path);
+    g_free (conflict_path);
     seafile_unref (seafile);
     return 0;
 
@@ -345,6 +395,8 @@ bad:
     /* Remove the tmp file if it still exists, in case that rename fails. */
     seaf_util_unlink (tmp_path);
     g_free (tmp_path);
+    g_free (backup_path);
+    g_free (conflict_path);
     seafile_unref (seafile);
     return -1;
 }
@@ -909,6 +961,38 @@ out:
 }
 
 static int
+check_existed_file_blocks (CDCFileDescriptor *cdc, GList *blockids)
+{
+    GList *q;
+    SHA_CTX file_ctx;
+    int ret = 0;
+
+    SHA1_Init (&file_ctx);
+    for (q = blockids; q; q = q->next) {
+        char *blk_id = q->data;
+        unsigned char sha1[20];
+
+        if (!seaf_block_manager_block_exists (
+                seaf->block_mgr, cdc->repo_id, cdc->version, blk_id)) {
+            ret = -1;
+            goto out;
+        }
+
+        hex_to_rawdata (blk_id, sha1, 20);
+        memcpy (cdc->blk_sha1s + cdc->block_nr * CHECKSUM_LENGTH,
+                sha1, CHECKSUM_LENGTH);
+        cdc->block_nr++;
+
+        SHA1_Update (&file_ctx, sha1, 20);
+    }
+
+    SHA1_Final (cdc->file_sum, &file_ctx);
+
+out:
+    return ret;
+}
+
+static int
 init_file_cdc (CDCFileDescriptor *cdc,
                const char *repo_id, int version,
                int block_nr, gint64 file_size)
@@ -954,6 +1038,76 @@ seaf_fs_manager_index_file_blocks (SeafFSManager *mgr,
         }
 
         if (check_and_write_file_blocks (&cdc, paths, blockids) < 0) {
+            seaf_warning ("Failed to check and write file blocks.\n");
+            ret = -1;
+            goto out;
+        }
+
+        if (write_seafile (mgr, repo_id, version, &cdc, sha1) < 0) {
+            seaf_warning ("Failed to write seafile.\n");
+            ret = -1;
+            goto out;
+        }
+    }
+
+out:
+    if (cdc.blk_sha1s)
+        free (cdc.blk_sha1s);
+
+    return ret;
+}
+
+int
+seaf_fs_manager_index_raw_blocks (SeafFSManager *mgr,
+                                  const char *repo_id,
+                                  int version,
+                                  GList *paths,
+                                  GList *blockids)
+{
+    int ret = 0;
+    GList *ptr, *q;
+
+    if (!paths)
+        return -1;
+
+    for (ptr = paths, q = blockids; ptr; ptr = ptr->next, q = q->next) {
+        char *path = ptr->data;
+        char *blk_id = q->data;
+        unsigned char sha1[20];
+
+        hex_to_rawdata (blk_id, sha1, 20);
+        ret = check_and_write_block (repo_id, version, path, sha1, blk_id);
+        if (ret < 0)
+            break;
+
+    }
+
+    return ret;
+}
+
+int
+seaf_fs_manager_index_existed_file_blocks (SeafFSManager *mgr,
+                                           const char *repo_id,
+                                           int version,
+                                           GList *blockids,
+                                           unsigned char sha1[],
+                                           gint64 file_size)
+{
+    int ret = 0;
+    CDCFileDescriptor cdc;
+
+    int block_nr = g_list_length (blockids);
+    if (block_nr == 0) {
+        /* handle empty file. */
+        memset (sha1, 0, 20);
+        create_cdc_for_empty_file (&cdc);
+    } else {
+        if (init_file_cdc (&cdc, repo_id, version, block_nr, file_size) < 0) {
+            ret = -1;
+            goto out;
+        }
+
+        if (check_existed_file_blocks (&cdc, blockids) < 0) {
             seaf_warning ("Failed to check and write file blocks.\n");
             ret = -1;
             goto out;
@@ -1061,14 +1215,14 @@ seafile_from_json_object (const char *id, json_t *object)
     /* Sanity checks. */
     type = json_object_get_int_member (object, "type");
     if (type != SEAF_METADATA_TYPE_FILE) {
-        seaf_warning ("Object %s is not a file.\n", id);
+        seaf_debug ("Object %s is not a file.\n", id);
         return NULL;
     }
 
     version = (int) json_object_get_int_member (object, "version");
     if (version < 1) {
-        seaf_warning ("Seafile object %s version should be > 0, version is %d.\n",
-                      id, version);
+        seaf_debug ("Seafile object %s version should be > 0, version is %d.\n",
+                    id, version);
         return NULL;
     }
 
@@ -1076,7 +1230,7 @@ seafile_from_json_object (const char *id, json_t *object)
 
     block_id_array = json_object_get (object, "block_ids");
     if (!block_id_array) {
-        seaf_warning ("No block id array in seafile object %s.\n", id);
+        seaf_debug ("No block id array in seafile object %s.\n", id);
         return NULL;
     }
 
@@ -1096,7 +1250,7 @@ seafile_from_json_object (const char *id, json_t *object)
     for (i = 0; i < seafile->n_blocks; ++i) {
         block_id_obj = json_array_get (block_id_array, i);
         block_id = json_string_value (block_id_obj);
-        if (!block_id) {
+        if (!block_id || !is_object_id_valid(block_id)) {
             seafile_free (seafile);
             return NULL;
         }
@@ -1370,7 +1524,13 @@ seaf_dirent_new (int version, const char *sha1, int mode, const char *name,
     dent->version = version;
     memcpy(dent->id, sha1, 40);
     dent->id[40] = '\0';
-    dent->mode = mode;
+    /* Mode for files must have 0644 set. To prevent the caller from forgetting,
+     * we set the bits here.
+     */
+    if (S_ISREG(mode))
+        dent->mode = (mode | 0644);
+    else
+        dent->mode = mode;
     dent->name = g_strdup(name);
     dent->name_len = strlen(name);
 
@@ -1482,13 +1642,17 @@ parse_dirent (const char *dir_id, int version, json_t *object)
 
     id = json_object_get_string_member (object, "id");
     if (!id) {
-        seaf_warning ("Dirent id not set for dir object %s.\n", dir_id);
+        seaf_debug ("Dirent id not set for dir object %s.\n", dir_id);
+        return NULL;
+    }
+    if (!is_object_id_valid (id)) {
+        seaf_debug ("Dirent id is invalid for dir object %s.\n", dir_id);
         return NULL;
     }
 
     name = json_object_get_string_member (object, "name");
     if (!name) {
-        seaf_warning ("Dirent name not set for dir object %s.\n", dir_id);
+        seaf_debug ("Dirent name not set for dir object %s.\n", dir_id);
         return NULL;
     }
 
@@ -1496,7 +1660,7 @@ parse_dirent (const char *dir_id, int version, json_t *object)
     if (S_ISREG(mode)) {
         modifier = json_object_get_string_member (object, "modifier");
         if (!modifier) {
-            seaf_warning ("Dirent modifier not set for dir object %s.\n", dir_id);
+            seaf_debug ("Dirent modifier not set for dir object %s.\n", dir_id);
             return NULL;
         }
         size = json_object_get_int_member (object, "size");
@@ -1528,20 +1692,20 @@ seaf_dir_from_json_object (const char *dir_id, json_t *object)
     /* Sanity checks. */
     type = json_object_get_int_member (object, "type");
     if (type != SEAF_METADATA_TYPE_DIR) {
-        seaf_warning ("Object %s is not a dir.\n", dir_id);
+        seaf_debug ("Object %s is not a dir.\n", dir_id);
         return NULL;
     }
 
     version = (int) json_object_get_int_member (object, "version");
     if (version < 1) {
-        seaf_warning ("Dir object %s version should be > 0, version is %d.\n",
-                      dir_id, version);
+        seaf_debug ("Dir object %s version should be > 0, version is %d.\n",
+                    dir_id, version);
         return NULL;
     }
 
     dirent_array = json_object_get (object, "dirents");
     if (!dirent_array) {
-        seaf_warning ("No dirents in dir object %s.\n", dir_id);
+        seaf_debug ("No dirents in dir object %s.\n", dir_id);
         return NULL;
     }
 
@@ -2403,6 +2567,7 @@ seaf_fs_manager_get_seafdir_by_path (SeafFSManager *mgr,
     dir = seaf_fs_manager_get_seafdir (mgr, repo_id, version, dir_id);
     if (!dir) {
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_DIR_MISSING, "directory is missing");
+        g_free (tmp_path);
         return NULL;
     }
 
@@ -2509,6 +2674,10 @@ seaf_fs_manager_path_to_obj_id (SeafFSManager *mgr,
 
     for (p = base_dir->entries; p != NULL; p = p->next) {
         dent = p->data;
+
+        if (!is_object_id_valid (dent->id))
+            continue;
+
         if (strcmp (dent->name, name) == 0) {
             obj_id = g_strdup (dent->id);
             if (mode) {
@@ -2905,4 +3074,11 @@ seafile_version_from_repo_version (int repo_version)
         return 0;
     else
         return CURRENT_SEAFILE_OBJ_VERSION;
+}
+
+int
+seaf_fs_manager_remove_store (SeafFSManager *mgr,
+                              const char *store_id)
+{
+    return seaf_obj_store_remove_store (mgr->obj_store, store_id);
 }

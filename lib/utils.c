@@ -209,7 +209,7 @@ objstore_get_path (char *path, const char *base, const char *obj_id)
  */
 #define UNIX_EPOCH 116444736000000000ULL
 
-inline static __time64_t
+__time64_t
 file_time_to_unix_time (FILETIME *ftime)
 {
     guint64 win_time, unix_time;
@@ -781,7 +781,7 @@ writen(int fd, const void *vptr, size_t n)
 
 
 ssize_t						/* Read "n" bytes from a descriptor. */
-recvn(int fd, void *vptr, size_t n)
+recvn(evutil_socket_t fd, void *vptr, size_t n)
 {
 	size_t	nleft;
 	ssize_t	nread;
@@ -810,7 +810,7 @@ recvn(int fd, void *vptr, size_t n)
 }
 
 ssize_t						/* Write "n" bytes to a descriptor. */
-sendn(int fd, const void *vptr, size_t n)
+sendn(evutil_socket_t fd, const void *vptr, size_t n)
 {
 	size_t		nleft;
 	ssize_t		nwritten;
@@ -1059,6 +1059,9 @@ is_uuid_valid (const char *uuid_str)
 {
     uuid_t uuid;
 
+    if (!uuid_str)
+        return FALSE;
+
     if (uuid_parse (uuid_str, uuid) < 0)
         return FALSE;
     return TRUE;
@@ -1092,6 +1095,9 @@ void gen_uuid_inplace (char *buf)
 gboolean
 is_uuid_valid (const char *uuid_str)
 {
+    if (!uuid_str)
+        return FALSE;
+
     UUID uuid;
     if (UuidFromString((unsigned char *)uuid_str, &uuid) != RPC_S_OK)
         return FALSE;
@@ -1099,6 +1105,29 @@ is_uuid_valid (const char *uuid_str)
 }
 
 #endif
+
+gboolean
+is_object_id_valid (const char *obj_id)
+{
+    if (!obj_id)
+        return FALSE;
+
+    int len = strlen(obj_id);
+    int i;
+    char c;
+
+    if (len != 40)
+        return FALSE;
+
+    for (i = 0; i < len; ++i) {
+        c = obj_id[i];
+        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))
+            continue;
+        return FALSE;
+    }
+
+    return TRUE;
+}
 
 char** strsplit_by_space (char *string, int *length)
 {
@@ -1491,65 +1520,85 @@ get_current_time()
 }
 
 #ifdef WIN32
+static SOCKET pg_serv_sock = INVALID_SOCKET;
+static struct sockaddr_in pg_serv_addr;
+
+/* pgpipe() should only be called in the main loop,
+ * since it accesses the static global socket.
+ */
 int
 pgpipe (ccnet_pipe_t handles[2])
 {
-    SOCKET s;
-    struct sockaddr_in serv_addr;
-    int len = sizeof( serv_addr );
+    int len = sizeof( pg_serv_addr );
 
     handles[0] = handles[1] = INVALID_SOCKET;
 
-    if ( ( s = socket( AF_INET, SOCK_STREAM, 0 ) ) == INVALID_SOCKET )
-    {
-        g_warning("pgpipe failed to create socket: %d\n", WSAGetLastError());
-        return -1;
+    if (pg_serv_sock == INVALID_SOCKET) {
+        if ((pg_serv_sock = socket(AF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET) {
+            g_warning("pgpipe failed to create socket: %d\n", WSAGetLastError());
+            return -1;
+        }
+
+        memset(&pg_serv_addr, 0, sizeof(pg_serv_addr));
+        pg_serv_addr.sin_family = AF_INET;
+        pg_serv_addr.sin_port = htons(0);
+        pg_serv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+        if (bind(pg_serv_sock, (SOCKADDR *)&pg_serv_addr, len) == SOCKET_ERROR) {
+            g_warning("pgpipe failed to bind: %d\n", WSAGetLastError());
+            closesocket(pg_serv_sock);
+            pg_serv_sock = INVALID_SOCKET;
+            return -1;
+        }
+
+        if (listen(pg_serv_sock, SOMAXCONN) == SOCKET_ERROR) {
+            g_warning("pgpipe failed to listen: %d\n", WSAGetLastError());
+            closesocket(pg_serv_sock);
+            pg_serv_sock = INVALID_SOCKET;
+            return -1;
+        }
+
+        struct sockaddr_in tmp_addr;
+        int tmp_len = sizeof(tmp_addr);
+        if (getsockname(pg_serv_sock, (SOCKADDR *)&tmp_addr, &tmp_len) == SOCKET_ERROR) {
+            g_warning("pgpipe failed to getsockname: %d\n", WSAGetLastError());
+            closesocket(pg_serv_sock);
+            pg_serv_sock = INVALID_SOCKET;
+            return -1;
+        }
+        pg_serv_addr.sin_port = tmp_addr.sin_port;
     }
 
-    memset( &serv_addr, 0, sizeof( serv_addr ) );
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(0);
-    serv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (bind(s, (SOCKADDR *) & serv_addr, len) == SOCKET_ERROR)
-    {
-        g_warning("pgpipe failed to bind: %d\n", WSAGetLastError());
-        closesocket(s);
-        return -1;
-    }
-    if (listen(s, 1) == SOCKET_ERROR)
-    {
-        g_warning("pgpipe failed to listen: %d\n", WSAGetLastError());
-        closesocket(s);
-        return -1;
-    }
-    if (getsockname(s, (SOCKADDR *) & serv_addr, &len) == SOCKET_ERROR)
-    {
-        g_warning("pgpipe failed to getsockname: %d\n", WSAGetLastError());
-        closesocket(s);
-        return -1;
-    }
     if ((handles[1] = socket(PF_INET, SOCK_STREAM, 0)) == INVALID_SOCKET)
     {
         g_warning("pgpipe failed to create socket 2: %d\n", WSAGetLastError());
-        closesocket(s);
+        closesocket(pg_serv_sock);
+        pg_serv_sock = INVALID_SOCKET;
         return -1;
     }
 
-    if (connect(handles[1], (SOCKADDR *) & serv_addr, len) == SOCKET_ERROR)
+    if (connect(handles[1], (SOCKADDR *)&pg_serv_addr, len) == SOCKET_ERROR)
     {
         g_warning("pgpipe failed to connect socket: %d\n", WSAGetLastError());
-        closesocket(s);
+        closesocket(handles[1]);
+        handles[1] = INVALID_SOCKET;
+        closesocket(pg_serv_sock);
+        pg_serv_sock = INVALID_SOCKET;
         return -1;
     }
-    if ((handles[0] = accept(s, (SOCKADDR *) & serv_addr, &len)) == INVALID_SOCKET)
+
+    struct sockaddr_in client_addr;
+    int client_len = sizeof(client_addr);
+    if ((handles[0] = accept(pg_serv_sock, (SOCKADDR *)&client_addr, &client_len)) == INVALID_SOCKET)
     {
         g_warning("pgpipe failed to accept socket: %d\n", WSAGetLastError());
         closesocket(handles[1]);
         handles[1] = INVALID_SOCKET;
-        closesocket(s);
+        closesocket(pg_serv_sock);
+        pg_serv_sock = INVALID_SOCKET;
         return -1;
     }
-    closesocket(s);
+
     return 0;
 }
 #endif
@@ -2382,6 +2431,14 @@ clean_utf8_data (char *data, int len)
     }
 }
 
+char *
+normalize_utf8_path (const char *path)
+{
+    if (!g_utf8_validate (path, -1, NULL))
+        return NULL;
+    return g_utf8_normalize (path, -1, G_NORMALIZE_NFC);
+}
+
 /* zlib related wrapper functions. */
 
 #define ZLIB_BUF_SIZE 16384
@@ -2482,4 +2539,39 @@ out:
         g_byte_array_free (barray, TRUE);
         return -1;
     }
+}
+
+char*
+format_dir_path (const char *path)
+{
+    int path_len = strlen (path);
+    char *rpath;
+    if (path[0] != '/') {
+        rpath = g_strconcat ("/", path, NULL);
+        path_len++;
+    } else {
+        rpath = g_strdup (path);
+    }
+    while (path_len > 1 && rpath[path_len-1] == '/') {
+        rpath[path_len-1] = '\0';
+        path_len--;
+    }
+
+    return rpath;
+}
+
+gboolean
+is_empty_string (const char *str)
+{
+    return !str || strcmp (str, "") == 0;
+}
+
+gboolean
+is_permission_valid (const char *perm)
+{
+    if (is_empty_string (perm)) {
+        return FALSE;
+    }
+
+    return strcmp (perm, "r") == 0 || strcmp (perm, "rw") == 0;
 }

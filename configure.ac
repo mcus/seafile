@@ -2,14 +2,15 @@ dnl Process this file with autoconf to produce a configure script.
 
 
 AC_PREREQ(2.61)
-AC_INIT([seafile], [4.4.1], [freeplant@gmail.com])
+AC_INIT([seafile], [6.0.1], [freeplant@gmail.com])
 AC_CONFIG_HEADER([config.h])
 
 AC_CONFIG_MACRO_DIR([m4])
 
 AM_INIT_AUTOMAKE([1.9 foreign])
 
-AC_MINGW32
+#AC_MINGW32
+AC_CANONICAL_BUILD
 
 dnl enable the build of share library by default
 AC_ENABLE_SHARED
@@ -35,9 +36,9 @@ AC_SYS_LARGEFILE
 
 # check platform
 AC_MSG_CHECKING(for WIN32)
-if test "$MINGW32" = yes; then
+if test "$build_os" = "mingw32" -o "$build_os" = "mingw64"; then
   bwin32=true
-  AC_MSG_RESULT(compile in mingw32)
+  AC_MSG_RESULT(compile in mingw)
 else
   AC_MSG_RESULT(no)
 fi
@@ -206,6 +207,7 @@ elif test "$bmac" = true ; then
   MSVC_CFLAGS=
   LIB_MAC="-framework CoreServices"
   LIB_CRYPT32=
+  LIB_ICONV=-liconv
 else
   LIB_WS32=
   LIB_GDI32=
@@ -233,6 +235,7 @@ AC_SUBST(LIB_PSAPI)
 AC_SUBST(LIB_MAC)
 AC_SUBST(MSVC_CFLAGS)
 AC_SUBST(LIB_CRYPT32)
+AC_SUBST(LIB_ICONV)
 
 
 LIBEVENT_REQUIRED=2.0
@@ -327,6 +330,19 @@ if test "${compile_gnome_keyring}" = "yes"; then
    AC_SUBST(GNOME_KEYRING_LIBS)
    AC_DEFINE(HAVE_KEYSTORAGE_GK, 1, [Have Gnome-Keyring support])
 fi
+
+BPWRAPPER_REQUIRED=0.1
+AC_ARG_ENABLE(breakpad, AC_HELP_STRING([--enable-breakpad], [build google breadpad support]),
+                               [compile_breakpad=$enableval],[compile_breakpad="no"])
+
+AM_CONDITIONAL([HAVE_BREAKPAD_SUPPORT], [test "${compile_breakpad}" = "yes"])
+if test "${compile_breakpad}" = "yes"; then
+   PKG_CHECK_MODULES(BPWRAPPER, [bpwrapper])
+   AC_DEFINE(HAVE_BREAKPAD_SUPPORT, 1, [Breakpad support enabled])
+   AC_SUBST(BPWRAPPER_CFLAGS)
+   AC_SUBST(BPWRAPPER_LIBS)
+fi
+
 
 ac_configure_args="$ac_configure_args -q"
 

@@ -1,37 +1,3 @@
-"""
-
-Repo:
-    id:                      Repo ID
-    name:                    Repo Name
-    desc:                    Repo description
-    worktree:                The full path of the worktree of the repo
-    worktree_changed:        True if the worktree is changed
-    worktree_checktime:      The last check time of whether worktree is changed
-    head_branch:             The name of the head branch
-    enctrypted:              True if the repo is encrypted
-    passwd:                  The password
-    
-
-Branch:
-    name:
-    commit_id:
-    repo_id:
-
-Commit:
-    id:
-    creator_name:
-    creator:                 The id of the creator
-    desc:
-    ctime:
-    repo_id:
-    root_id:
-    parent_id:
-    second_parent_id:
-
-
-"""
-
-
 from datetime import datetime
 import json
 import logging
@@ -50,33 +16,33 @@ _DEBUG = 'SEAFILE_DEBUG' in os.environ
 ENVIRONMENT_VARIABLES = ('CCNET_CONF_DIR', 'SEAFILE_CONF_DIR')
 
 # Used to fix bug in some rpc calls, will be removed in near future.
-MAX_INT = 2147483647            
+MAX_INT = 2147483647
 
-### Loading ccnet and seafile configurations ###
-'''ccnet'''
-try:
-    CCNET_CONF_PATH = os.environ[ENVIRONMENT_VARIABLES[0]]
-    if not CCNET_CONF_PATH: # If it's set but is an empty string.
-        raise KeyError
-except KeyError:
-    raise ImportError("Seaserv cannot be imported, because environment variable %s is undefined." % ENVIRONMENT_VARIABLES[0])
-else:
+def _load_path_from_env(key, check=True):
+    v = os.environ.get(key, '')
+    if not v:
+        if check:
+            raise ImportError("Seaserv cannot be imported, because environment variable %s is undefined." % key)
+        return None
     if _DEBUG:
-        print "Loading ccnet config from " + CCNET_CONF_PATH
+        print "Loading %s from %s" % (key, v)
+    return os.path.normpath(os.path.expanduser(v))
 
-CCNET_CONF_PATH = os.path.normpath(os.path.expanduser(CCNET_CONF_PATH))
+CCNET_CONF_PATH = _load_path_from_env('CCNET_CONF_DIR')
+SEAFILE_CONF_DIR = _load_path_from_env('SEAFILE_CONF_DIR')
+SEAFILE_CENTRAL_CONF_DIR = _load_path_from_env('SEAFILE_CENTRAL_CONF_DIR', check=False)
 
-pool = ccnet.ClientPool(CCNET_CONF_PATH)
+pool = ccnet.ClientPool(CCNET_CONF_PATH, central_config_dir=SEAFILE_CENTRAL_CONF_DIR)
 ccnet_rpc = ccnet.CcnetRpcClient(pool, req_pool=True)
 ccnet_threaded_rpc = ccnet.CcnetThreadedRpcClient(pool, req_pool=True)
-monitor_rpc = seafile.MonitorRpcClient(pool)
 seafserv_rpc = seafile.ServerRpcClient(pool, req_pool=True)
 seafserv_threaded_rpc = seafile.ServerThreadedRpcClient(pool, req_pool=True)
 
 # load ccnet server addr and port from ccnet.conf.
 # 'addr:port' is used when downloading a repo
 config = ConfigParser.ConfigParser()
-config.read(os.path.join(CCNET_CONF_PATH, 'ccnet.conf'))
+config.read(os.path.join(SEAFILE_CENTRAL_CONF_DIR if SEAFILE_CENTRAL_CONF_DIR else CCNET_CONF_PATH,
+                         'ccnet.conf'))
 
 if config.has_option('General', 'SERVICE_URL'):
     service_url = config.get('General', 'SERVICE_URL')
@@ -95,20 +61,8 @@ else:
     SERVICE_URL = None
 
 SERVER_ID = config.get('General', 'ID')
-
-'''seafile'''
-try:
-    SEAFILE_CONF_DIR = os.environ[ENVIRONMENT_VARIABLES[1]]
-    if not SEAFILE_CONF_DIR: # If it's set but is an empty string.
-        raise KeyError
-except KeyError:
-    raise ImportError("Seaserv cannot be imported, because environment variable %s is undefined." % ENVIRONMENT_VARIABLES[1])
-else:
-    if _DEBUG:
-        print "Loading seafile config from " + SEAFILE_CONF_DIR
-
-SEAFILE_CONF_DIR = os.path.normpath(os.path.expanduser(SEAFILE_CONF_DIR))
-config.read(os.path.join(SEAFILE_CONF_DIR, 'seafile.conf'))
+config.read(os.path.join(SEAFILE_CENTRAL_CONF_DIR if SEAFILE_CENTRAL_CONF_DIR else SEAFILE_CONF_DIR,
+                         'seafile.conf'))
 
 def get_fileserver_option(key, default):
     '''
@@ -152,12 +106,15 @@ logger = logging.getLogger(__name__)
 
 #### Basic ccnet API ####
 
-def get_emailusers(source, start, limit):
-    try:
-        users = ccnet_threaded_rpc.get_emailusers(source, start, limit)
-    except SearpcError:
-        users = []
-    return users
+def get_emailusers(source, start, limit, is_active=None):
+    if is_active is True:
+        status = "active"       # list active users
+    elif is_active is False:
+        status = "inactive"     # list inactive users
+    else:
+        status = ""             # list all users
+
+    return ccnet_threaded_rpc.get_emailusers(source, start, limit, status)
 
 def count_emailusers():
     try:
@@ -165,6 +122,9 @@ def count_emailusers():
     except SearpcError:
         ret = -1
     return 0 if ret < 0 else ret
+
+def get_emailuser_with_import(email):
+    return ccnet_threaded_rpc.get_emailuser_with_import(email)
 
 def get_session_info():
     return ccnet_rpc.get_session_info()

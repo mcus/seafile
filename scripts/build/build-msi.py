@@ -57,6 +57,8 @@ CONF_ONLY_CHINESE       = 'onlychinese'
 CONF_QT_ROOT            = 'qt_root'
 CONF_QT5                = 'qt5'
 CONF_WITH_SHIB          = 'with_shib'
+CONF_BRAND              = 'brand'
+CONF_CERTFILE           = 'certfile'
 
 ####################
 ### Common helper functions
@@ -297,8 +299,12 @@ class Seafile(Project):
     name = 'seafile'
     def __init__(self):
         Project.__init__(self)
+        if breakpad_enabled():
+            enable_breakpad = '--enable-breakpad'
+        else:
+            enable_breakpad = ''
         self.build_commands = [
-            'sh ./configure --prefix=%s' % to_mingw_path(self.prefix),
+            'sh ./configure %s --prefix=%s' % (enable_breakpad, to_mingw_path(self.prefix)),
             get_make_path(),
             '%s install' % get_make_path(),
         ]
@@ -422,6 +428,11 @@ def validate_args(usage, options):
     # [qt5]
     qt5 = get_option(CONF_QT5)
     with_shib = get_option(CONF_WITH_SHIB)
+    brand = get_option(CONF_BRAND)
+    cert = get_option(CONF_CERTFILE)
+    if cert is not None:
+        if not os.path.exists(cert):
+            error('cert file "{}" does not exist'.format(cert))
 
     conf[CONF_VERSION] = version
     conf[CONF_LIBSEARPC_VERSION] = libsearpc_version
@@ -438,6 +449,8 @@ def validate_args(usage, options):
     conf[CONF_QT_ROOT] = qt_root
     conf[CONF_QT5] = qt5
     conf[CONF_WITH_SHIB] = with_shib
+    conf[CONF_BRAND] = brand
+    conf[CONF_CERTFILE] = cert
 
     prepare_builddir(builddir)
     show_build_info()
@@ -553,6 +566,17 @@ def parse_args():
                       dest=CONF_WITH_SHIB,
                       action='store_true',
                       help='''build seafile client with shibboleth support''')
+
+    parser.add_option(long_opt(CONF_BRAND),
+                      dest=CONF_BRAND,
+                      default='seafile',
+                      help='''brand name of the package''')
+
+    parser.add_option(long_opt(CONF_CERTFILE),
+                      nargs=1,
+                      default=None,
+                      dest=CONF_CERTFILE,
+                      help='''The cert for signing the executables and the installer.''')
 
     usage = parser.format_help()
     options, remain = parser.parse_args()
@@ -763,6 +787,42 @@ def prepare_msi():
 
     copy_dll_exe()
 
+def sign_executables():
+    certfile = conf.get(CONF_CERTFILE)
+    if certfile is None:
+        info('exectuable signing is skipped since no cert is provided.')
+        return
+
+    pack_dir = os.path.join(conf[CONF_BUILDDIR], 'pack')
+    exectuables = glob.glob(os.path.join(pack_dir, 'bin', '*.exe'))
+    for exe in exectuables:
+        do_sign(certfile, exe)
+
+def sign_installers():
+    certfile = conf.get(CONF_CERTFILE)
+    if certfile is None:
+        info('msi signing is skipped since no cert is provided.')
+        return
+
+    pack_dir = os.path.join(conf[CONF_BUILDDIR], 'pack')
+    installers = glob.glob(os.path.join(pack_dir, '*.msi'))
+    for fn in installers:
+        do_sign(certfile, fn, desc='Seafile Installer')
+
+def do_sign(certfile, fn, desc=None):
+    certfile = to_win_path(certfile)
+    fn = to_win_path(fn)
+    info('signing file {} using cert "{}"'.format(fn, certfile))
+
+    if desc:
+        desc_flags = '-d "{}"'.format(desc)
+    else:
+        desc_flags = ''
+
+    signcmd = 'signtool.exe sign -fd sha256 -t http://timestamp.digicert.com -f {} {} {}'.format(certfile, desc_flags, fn)
+    if run(signcmd, cwd=os.path.dirname(fn)) != 0:
+        error('Failed to sign file "{}"'.format(fn))
+
 def strip_symbols():
     bin_dir = os.path.join(conf[CONF_BUILDDIR], 'pack', 'bin')
     def do_strip(fn, stripcmd='strip'):
@@ -800,9 +860,32 @@ def edit_fragment_wxs():
     with open(file_path, 'w') as fp:
         fp.write(content)
 
+def breakpad_enabled():
+    return conf[CONF_VERSION] >= '5.0.3'
+
+def generate_breakpad_symbols():
+    seafiledir = Seafile().projdir
+    script = os.path.join(seafiledir, 'scripts/breakpad.py')
+    symbol_file = 'seaf-daemon.exe.sym-%s' % conf[CONF_VERSION]
+    output = os.path.join(seafiledir, symbol_file)
+
+    # generate the breakpad symbols
+    if run('python %s --output %s' % (script, output)) != 0:
+        error('Error when generating breakpad symbols')
+
+    # move symbols to output directory
+    dst_symbol_file = os.path.join(conf[CONF_OUTPUTDIR], symbol_file)
+    must_copy(output, dst_symbol_file)
+
 def build_msi():
     prepare_msi()
+    if breakpad_enabled():
+        generate_breakpad_symbols()
     strip_symbols()
+
+    # Only sign the exectuables after stripping symbols.
+    sign_executables()
+
     pack_dir = os.path.join(conf[CONF_BUILDDIR], 'pack')
     if run('make fragment.wxs', cwd=pack_dir) != 0:
         error('Error when make fragement.wxs')
@@ -829,10 +912,11 @@ def build_german_msi():
 def move_msi():
     pack_dir = os.path.join(conf[CONF_BUILDDIR], 'pack')
     src_msi = os.path.join(pack_dir, 'seafile.msi')
+    brand = conf[CONF_BRAND]
     if not conf[CONF_WITH_SHIB]:
-        dst_msi = os.path.join(conf[CONF_OUTPUTDIR], 'seafile-%s.msi' % conf[CONF_VERSION])
+        dst_msi = os.path.join(conf[CONF_OUTPUTDIR], '%s-%s.msi' % (brand, conf[CONF_VERSION]))
     else:
-        dst_msi = os.path.join(conf[CONF_OUTPUTDIR], 'seafile-%s-shibboleth.msi' % conf[CONF_VERSION])
+        dst_msi = os.path.join(conf[CONF_OUTPUTDIR], '%s-%s-shibboleth.msi' % (brand, conf[CONF_VERSION]))
 
     # move msi to outputdir
     must_copy(src_msi, dst_msi)
@@ -840,15 +924,15 @@ def move_msi():
     if not conf[CONF_ONLY_CHINESE]:
         src_msi_en = os.path.join(pack_dir, 'seafile-en.msi')
         if not conf[CONF_WITH_SHIB]:
-            dst_msi_en = os.path.join(conf[CONF_OUTPUTDIR], 'seafile-%s-en.msi' % conf[CONF_VERSION])
+            dst_msi_en = os.path.join(conf[CONF_OUTPUTDIR], '%s-%s-en.msi' % (brand, conf[CONF_VERSION]))
         else:
-            dst_msi_en = os.path.join(conf[CONF_OUTPUTDIR], 'seafile-%s-en-shibboleth.msi' % conf[CONF_VERSION])
+            dst_msi_en = os.path.join(conf[CONF_OUTPUTDIR], '%s-%s-en-shibboleth.msi' % (brand, conf[CONF_VERSION]))
         must_copy(src_msi_en, dst_msi_en)
         src_msi_de = os.path.join(pack_dir, 'seafile-de.msi')
         if not conf[CONF_WITH_SHIB]:
-            dst_msi_de = os.path.join(conf[CONF_OUTPUTDIR], 'seafile-%s-de.msi' % conf[CONF_VERSION])
+            dst_msi_de = os.path.join(conf[CONF_OUTPUTDIR], '%s-%s-de.msi' % (brand, conf[CONF_VERSION]))
         else:
-            dst_msi_de = os.path.join(conf[CONF_OUTPUTDIR], 'seafile-%s-de-shibboleth.msi' % conf[CONF_VERSION])
+            dst_msi_de = os.path.join(conf[CONF_OUTPUTDIR], '%s-%s-de-shibboleth.msi' % (brand, conf[CONF_VERSION]))
         must_copy(src_msi_de, dst_msi_de)
 
     print '---------------------------------------------'
@@ -904,6 +988,7 @@ def main():
         build_english_msi()
         build_german_msi()
 
+    sign_installers()
     move_msi()
 
 if __name__ == '__main__':

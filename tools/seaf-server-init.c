@@ -36,17 +36,19 @@ save_config_file (GKeyFile *key_file, const char *path)
     return 0;
 }
 
-static const char *short_opts = "hvd:p:P:";
+static const char *short_opts = "hvd:p:P:F:";
 static const struct option long_opts[] = {
     { "help", no_argument, NULL, 'h' },
     { "verbose", no_argument, NULL, 'v' },
     { "seafile-dir", required_argument, NULL, 'd' },
+    { "central-config-dir", required_argument, NULL, 'F' },
     { "port", required_argument, NULL, 'p' },
     { "fileserver-port", required_argument, NULL, 'P' },
     { 0, 0, 0, 0 },
 };
 
 struct seaf_server_config {
+    char *central_config_dir;
     char *seafile_dir;
     char *port;
     char *fileserver_port;
@@ -63,11 +65,12 @@ void usage(int code) {
 "\nUsage: seaf-server-init [OPTIONS]\n"
 "Initialize your seafile server configuration\n\n"
 "Required arguments are:\n\n" 
-"  -h, --help             output help and quit\n"
-"  -v, --verbose          output more information\n"
-"  -d, --seafile-dir      specify a diretory to put your seafile server config and data\n" 
-"  -p, --port             specify a port to to transmit data\n" 
-"  -P, --fileserver-port  specify the port to use by fileserver\n" 
+"  -h, --help                output help and quit\n"
+"  -v, --verbose             output more information\n"
+"  -d, --seafile-dir         specify a directory to put your seafile server config and data\n"
+"  -F, --central-config-dir  specify a central config dir\n"
+"  -p, --port                specify a port to to transmit data\n"
+"  -P, --fileserver-port     specify the port to use by fileserver\n"
         );
     exit(code);
 }
@@ -75,7 +78,6 @@ void usage(int code) {
 int main (int argc, char **argv)
 {
     gboolean verbose = FALSE;
-    int ret;
 
     if (argc == 1)
         usage(1);
@@ -88,6 +90,9 @@ int main (int argc, char **argv)
             break;
         case 'v':
             verbose = TRUE;
+            break;
+        case 'F':
+            config.central_config_dir = strdup(optarg);
             break;
         case 'd':
             config.seafile_dir = strdup(optarg);
@@ -103,7 +108,7 @@ int main (int argc, char **argv)
         }
     }
 
-    if (!config.seafile_dir) {
+    if (!config.seafile_dir && !config.central_config_dir) {
         fprintf (stderr, "You must specify seafile data dir\n");
         usage(1);
     }
@@ -124,13 +129,21 @@ int main (int argc, char **argv)
 
     struct stat st;
     if (g_lstat (config.seafile_dir, &st) < 0) {
-        if (g_mkdir (config.seafile_dir, 0777) < 0) {
+        if (g_mkdir (config.seafile_dir, 0700) < 0) {
             fprintf (stderr, "Directory %s cannot be created.\n", config.seafile_dir);
             return 1;
         }
     }
 
-    char *seafile_conf = g_build_filename (config.seafile_dir, "seafile.conf", NULL);
+    if (config.central_config_dir && g_lstat (config.central_config_dir, &st) < 0) {
+        if (g_mkdir (config.central_config_dir, 0700) < 0) {
+            fprintf (stderr, "Directory %s cannot be created.\n", config.central_config_dir);
+            return 1;
+        }
+    }
+
+    const char *confdir = config.central_config_dir ? config.central_config_dir : config.seafile_dir;
+    char *seafile_conf = g_build_filename (confdir, "seafile.conf", NULL);
 
     if (verbose)
         printf ("Generating config files:           %s\n", seafile_conf);

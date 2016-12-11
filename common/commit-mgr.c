@@ -164,6 +164,8 @@ seaf_commit_free (SeafCommit *commit)
     if (commit->second_parent_id) g_free (commit->second_parent_id);
     if (commit->repo_name) g_free (commit->repo_name);
     if (commit->repo_desc) g_free (commit->repo_desc);
+    if (commit->device_name) g_free (commit->device_name);
+    g_free (commit->client_version);
     g_free (commit->magic);
     g_free (commit->random_key);
     g_free (commit);
@@ -620,6 +622,12 @@ commit_to_json_object (SeafCommit *commit)
                                    commit->repo_desc);
     json_object_set_string_or_null_member (object, "repo_category",
                                            commit->repo_category);
+    if (commit->device_name)
+        json_object_set_string_member (object, "device_name", commit->device_name);
+
+    if (commit->client_version)
+        json_object_set_string_member (object, "client_version", commit->client_version);
+
     if (commit->encrypted)
         json_object_set_string_member (object, "encrypted", "true");
 
@@ -658,6 +666,8 @@ commit_from_json_object (const char *commit_id, json_t *object)
     const char *repo_name;
     const char *repo_desc;
     const char *repo_category;
+    const char *device_name;
+    const char *client_version;
     const char *encrypted = NULL;
     int enc_version = 0;
     const char *magic = NULL;
@@ -680,8 +690,15 @@ commit_from_json_object (const char *commit_id, json_t *object)
     second_parent_id = json_object_get_string_or_null_member (object, "second_parent_id");
 
     repo_name = json_object_get_string_member (object, "repo_name");
+    if (!repo_name)
+        repo_name = "";
     repo_desc = json_object_get_string_member (object, "repo_desc");
+    if (!repo_desc)
+        repo_desc = "";
     repo_category = json_object_get_string_or_null_member (object, "repo_category");
+    device_name = json_object_get_string_or_null_member (object, "device_name");
+    client_version = json_object_get_string_or_null_member (object, "client_version");
+
     if (json_object_has_member (object, "encrypted"))
         encrypted = json_object_get_string_or_null_member (object, "encrypted");
 
@@ -710,12 +727,11 @@ commit_from_json_object (const char *commit_id, json_t *object)
 
 
     /* sanity check for incoming values. */
-    if (!repo_id || strlen(repo_id) != 36 ||
-        !root_id || strlen(root_id) != 40 ||
+    if (!repo_id || !is_uuid_valid(repo_id)  ||
+        !root_id || !is_object_id_valid(root_id) ||
         !creator || strlen(creator) != 40 ||
-        (parent_id && strlen(parent_id) != 40) ||
-        (second_parent_id && strlen(second_parent_id) != 40) ||
-        (enc_version >= 1 && magic == NULL))
+        (parent_id && !is_object_id_valid(parent_id)) ||
+        (second_parent_id && !is_object_id_valid(second_parent_id)))
         return commit;
 
     switch (enc_version) {
@@ -736,9 +752,9 @@ commit_from_json_object (const char *commit_id, json_t *object)
         return NULL;
     }
 
-    char *creator_name_l = g_ascii_strdown (creator_name, -1);
+    char *creator_name_l = creator_name ? g_ascii_strdown (creator_name, -1) : NULL;
     commit = seaf_commit_new (commit_id, repo_id, root_id,
-                              creator_name, creator, desc, ctime);
+                              creator_name_l, creator, desc, ctime);
     g_free (creator_name_l);
 
     commit->parent_id = parent_id ? g_strdup(parent_id) : NULL;
@@ -752,6 +768,8 @@ commit_from_json_object (const char *commit_id, json_t *object)
         commit->encrypted = FALSE;
     if (repo_category)
         commit->repo_category = g_strdup(repo_category);
+    commit->device_name = g_strdup(device_name);
+    commit->client_version = g_strdup(client_version);
 
     if (commit->encrypted) {
         commit->enc_version = enc_version;
@@ -867,4 +885,11 @@ delete_commit (SeafCommitManager *mgr,
                const char *id)
 {
     seaf_obj_store_delete_obj (mgr->obj_store, repo_id, version, id);
+}
+
+int
+seaf_commit_manager_remove_store (SeafCommitManager *mgr,
+                                  const char *store_id)
+{
+    return seaf_obj_store_remove_store (mgr->obj_store, store_id);
 }

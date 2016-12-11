@@ -28,6 +28,7 @@
 #include "mq-mgr.h"
 
 #include "http-server.h"
+#include "zip-download-mgr.h"
 
 #include <searpc-client.h>
 
@@ -48,6 +49,7 @@ struct _SeafileSession {
     /* Used in threads. */
     CcnetClientPool     *client_pool;
 
+    char                *central_config_dir;
     char                *seaf_dir;
     char                *tmp_file_dir;
     /* Config that's only loaded on start */
@@ -85,12 +87,14 @@ struct _SeafileSession {
     int                  sync_thread_pool_size;
 
     HttpServerStruct    *http_server;
+    ZipDownloadMgr      *zip_download_mgr;
 };
 
 extern SeafileSession *seaf;
 
 SeafileSession *
-seafile_session_new(const char *seafile_dir,
+seafile_session_new(const char *central_config_dir, 
+                    const char *seafile_dir,
                     struct _CcnetClient *ccnet_session);
 int
 seafile_session_init (SeafileSession *session);
@@ -102,9 +106,6 @@ char *
 seafile_session_get_tmp_file_path (SeafileSession *session,
                                    const char *basename,
                                    char path[]);
-
-int
-seafile_session_set_monitor (SeafileSession *session, const char *peer_id);
 
 void
 schedule_create_system_default_repo (SeafileSession *session);

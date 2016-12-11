@@ -14,6 +14,8 @@ import getpass
 import uuid
 import warnings
 import MySQLdb
+import argparse
+import socket
 
 from ConfigParser import ConfigParser
 
@@ -124,6 +126,8 @@ Press ENTER to continue
     @staticmethod
     def must_mkdir(path):
         '''Create a directory, exit on failure'''
+        if os.path.exists(path):
+            return
         try:
             os.mkdir(path)
         except OSError, e:
@@ -277,6 +281,13 @@ class InvalidAnswer(Exception):
     def __str__(self):
         return self.msg
 
+class InvalidParams(Exception):
+    def __init__(self, msg):
+        Exception.__init__(self)
+        self.msg = msg
+    def __str__(self):
+        return self.msg
+
 ### END of Utils
 ####################
 
@@ -286,6 +297,8 @@ class EnvManager(object):
         self.install_path = os.path.dirname(os.path.abspath(__file__))
         self.top_dir = os.path.dirname(self.install_path)
         self.bin_dir = os.path.join(self.install_path, 'seafile', 'bin')
+        self.central_config_dir = os.path.join(self.top_dir, 'conf')
+        Utils.must_mkdir(self.central_config_dir)
 
     def check_pre_condiction(self):
         def error_if_not_exists(path):
@@ -360,6 +373,7 @@ class AbstractDBConfigurator(AbstractConfigurator):
         AbstractConfigurator.__init__(self)
         self.mysql_host = 'localhost'
         self.mysql_port = 3306
+        self.mysql_userhost = 'localhost'
 
         self.use_existing_db = False
 
@@ -396,34 +410,55 @@ Please choose a way to initialize seafile databases:
                                   note=note,
                                   validate=validate)
 
-    def ask_mysql_host_port(self):
-        def validate(host):
-            if not re.match(r'^[a-zA-Z0-9_\-\.]+$', host):
-                raise InvalidAnswer('%s is not a valid host' % Utils.highlight(host))
+    def validate_mysql_host(self, host):
+        if not re.match(r'^[a-zA-Z0-9_\-\.]+$', host):
+            raise InvalidAnswer('%s is not a valid host' % Utils.highlight(host))
 
-            if host == 'localhost':
-                host = '127.0.0.1'
+        if host == 'localhost':
+            host = '127.0.0.1'
+        return host
 
-            question = 'What is the port of mysql server?'
-            key = 'mysql server port'
-            default = '3306'
-            port = Utils.ask_question(question,
-                                      key=key,
-                                      default=default,
-                                      validate=Utils.validate_port)
-
-            # self.check_mysql_server(host, port)
-            self.mysql_port = port
-
-            return host
-
+    def ask_mysql_host(self):
         question = 'What is the host of mysql server?'
         key = 'mysql server host'
         default = 'localhost'
         self.mysql_host = Utils.ask_question(question,
                                              key=key,
                                              default=default,
-                                             validate=validate)
+                                             validate=self.validate_mysql_host)
+
+    def validate_mysql_user_host(self, mysql_userhost):
+        if mysql_userhost != '%':
+            if not re.match(r'^[^.].+\..+[^.]$', mysql_userhost):
+                raise InvalidAnswer('%s is not a valid ip or domain' % mysql_userhost)
+        return mysql_userhost
+
+    def ask_mysql_user_host(self):
+        question = 'Which hosts should be able to use your MySQL Account?'
+        key = 'mysql user host'
+        default = '%'
+        self.mysql_userhost = Utils.ask_question(question,
+                                                 key=key,
+                                                 default=default,
+                                                 validate=self.validate_mysql_user_host)
+
+    def ask_mysql_port(self):
+        question = 'What is the port of mysql server?'
+        key = 'mysql server port'
+        default = '3306'
+        port = Utils.ask_question(question,
+                                  key=key,
+                                  default=default,
+                                  validate=Utils.validate_port)
+
+        # self.check_mysql_server(host, port)
+        self.mysql_port = port
+
+    def ask_mysql_host_port(self):
+        self.ask_mysql_host()
+        if self.mysql_host != '127.0.0.1':
+            self.ask_mysql_user_host()
+        self.ask_mysql_port()
 
     def check_mysql_server(self, host, port):
         print '\nverifying mysql server running ... ',
@@ -520,31 +555,34 @@ class NewDBConfigurator(AbstractDBConfigurator):
             self.create_user()
         self.create_databases()
 
-    def ask_root_password(self):
-        def validate(password):
-            self.root_conn = self.check_mysql_user('root', password)
-            return password
+    def validate_root_passwd(self, password):
+        self.root_conn = self.check_mysql_user('root', password)
+        return password
 
+    def ask_root_password(self):
         question = 'What is the password of the mysql root user?'
         key = 'root password'
         self.root_password = Utils.ask_question(question,
                                                 key=key,
-                                                validate=validate,
+                                                validate=self.validate_root_passwd,
                                                 password=True)
 
     def mysql_user_exists(self, user):
         cursor = self.root_conn.cursor()
 
-        sql = '''SELECT EXISTS(SELECT 1 FROM mysql.user WHERE user = '%s')''' % user
+        sql = '''SELECT EXISTS(SELECT 1 FROM mysql.user WHERE user = '%s' and host = '%s')''' % \
+                (user, self.mysql_userhost)
 
         try:
             cursor.execute(sql)
             return cursor.fetchall()[0][0]
         except Exception, e:
             if isinstance(e, MySQLdb.OperationalError):
-                Utils.error('Failed to check mysql user %s: %s' % (user, e.args[1]))
+                Utils.error('Failed to check mysql user %s@%s: %s' % \
+                            (user, self.mysql_userhost, e.args[1]))
             else:
-                Utils.error('Failed to check mysql user %s: %s' % (user, e))
+                Utils.error('Failed to check mysql user %s@%s: %s' % \
+                            (user, self.mysql_userhost, e))
         finally:
             cursor.close()
 
@@ -591,16 +629,16 @@ class NewDBConfigurator(AbstractDBConfigurator):
 
     def create_user(self):
         cursor = self.root_conn.cursor()
-        sql = '''CREATE USER '%s'@'localhost' IDENTIFIED BY '%s' ''' \
-              % (self.seafile_mysql_user, self.seafile_mysql_password)
+        sql = '''CREATE USER '%s'@'%s' IDENTIFIED BY '%s' ''' \
+              % (self.seafile_mysql_user, self.mysql_userhost, self.seafile_mysql_password)
 
         try:
             cursor.execute(sql)
         except Exception, e:
             if isinstance(e, MySQLdb.OperationalError):
-                Utils.error('Failed to create mysql user %s: %s' % (self.seafile_mysql_user, e.args[1]))
+                Utils.error('Failed to create mysql user %s@%s: %s' % (self.seafile_mysql_user, self.mysql_userhost, e.args[1]))
             else:
-                Utils.error('Failed to create mysql user %s: %s' % (self.seafile_mysql_user, e))
+                Utils.error('Failed to create mysql user %s@%s: %s' % (self.seafile_mysql_user, self.mysql_userhost, e))
         finally:
             cursor.close()
 
@@ -622,8 +660,8 @@ class NewDBConfigurator(AbstractDBConfigurator):
 
     def grant_db_permission(self, db_name):
         cursor = self.root_conn.cursor()
-        sql = '''GRANT ALL PRIVILEGES ON `%s`.* to `%s`@localhost ''' \
-              % (db_name, self.seafile_mysql_user)
+        sql = '''GRANT ALL PRIVILEGES ON `%s`.* to `%s`@`%s` ''' \
+              % (db_name, self.seafile_mysql_user, self.mysql_userhost)
 
         try:
             cursor.execute(sql)
@@ -679,18 +717,16 @@ class ExistingDBConfigurator(AbstractDBConfigurator):
                                                      key=key,
                                                      validate=validate)
 
+    def validate_db_name(self, db_name):
+        self.check_user_db_access(db_name)
+        return db_name
+
     def ask_db_name(self, program):
-        def validate(db_name):
-            if self.seafile_mysql_user != 'root':
-                self.check_user_db_access(db_name)
-
-            return db_name
-
         question = 'Enter the existing database name for %s:' % program
         key = '%s database' % program
         return Utils.ask_question(question,
                                   key=key,
-                                  validate=validate)
+                                  validate=self.validate_db_name)
 
     def check_user_db_access(self, db_name):
         user = self.seafile_mysql_user
@@ -704,6 +740,9 @@ class ExistingDBConfigurator(AbstractDBConfigurator):
                                    passwd=password,
                                    db=db_name)
 
+            cursor = conn.cursor()
+            cursor.execute('show tables')
+            cursor.close()
         except Exception, e:
             if isinstance(e, MySQLdb.OperationalError):
                 raise InvalidAnswer('Failed to access database %s using user "%s" and password "***": %s' \
@@ -718,7 +757,7 @@ class ExistingDBConfigurator(AbstractDBConfigurator):
 
 
 class CcnetConfigurator(AbstractConfigurator):
-    SERVER_NAME_REGEX = r'^[a-zA-Z0-9_\-]{3,14}$'
+    SERVER_NAME_REGEX = r'^[a-zA-Z0-9_\-]{3,15}$'
     SERVER_IP_OR_DOMAIN_REGEX = r'^[^.].+\..+[^.]$'
 
     def __init__(self):
@@ -726,12 +765,15 @@ class CcnetConfigurator(AbstractConfigurator):
         AbstractConfigurator.__init__(self)
         self.ccnet_dir = os.path.join(env_mgr.top_dir, 'ccnet')
         self.port = 10001
-        self.server_name = 'my-seafile'
+        self.server_name = None
         self.ip_or_domain = None
+        self.ccnet_conf = os.path.join(env_mgr.central_config_dir, 'ccnet.conf')
 
     def ask_questions(self):
-        self.ask_server_name()
-        self.ask_server_ip_or_domain()
+        if not self.server_name:
+            self.ask_server_name()
+        if not self.ip_or_domain:
+            self.ask_server_ip_or_domain()
         # self.ask_port()
 
     def generate(self):
@@ -739,6 +781,7 @@ class CcnetConfigurator(AbstractConfigurator):
         ccnet_init = os.path.join(env_mgr.bin_dir, 'ccnet-init')
         argv = [
             ccnet_init,
+            '-F', env_mgr.central_config_dir,
             '--config-dir', self.ccnet_dir,
             '--name', self.server_name,
             '--host', self.ip_or_domain,
@@ -751,8 +794,7 @@ class CcnetConfigurator(AbstractConfigurator):
         self.generate_db_conf()
 
     def generate_db_conf(self):
-        ccnet_conf = os.path.join(self.ccnet_dir, 'ccnet.conf')
-        config = Utils.read_config(ccnet_conf)
+        config = Utils.read_config(self.ccnet_conf)
         # [Database]
         # ENGINE=
         # HOST=
@@ -770,35 +812,35 @@ class CcnetConfigurator(AbstractConfigurator):
         config.set(db_section, 'DB', db_config.ccnet_db_name)
         config.set(db_section, 'CONNECTION_CHARSET', 'utf8')
 
-        Utils.write_config(config, ccnet_conf)
+        Utils.write_config(config, self.ccnet_conf)
+
+    def validate_server_name(self, name):
+        if not re.match(self.SERVER_NAME_REGEX, name):
+            raise InvalidAnswer('%s is not a valid name' % Utils.highlight(name))
+        return name
 
     def ask_server_name(self):
-        def validate(name):
-            if not re.match(self.SERVER_NAME_REGEX, name):
-                raise InvalidAnswer('%s is not a valid name' % Utils.highlight(name))
-            return name
-
         question = 'What is the name of the server? It will be displayed on the client.'
         key = 'server name'
         note = '3 - 15 letters or digits'
         self.server_name = Utils.ask_question(question,
                                               key=key,
                                               note=note,
-                                              validate=validate)
+                                              validate=self.validate_server_name)
+
+    def validate_server_ip(self, ip_or_domain):
+        if not re.match(self.SERVER_IP_OR_DOMAIN_REGEX, ip_or_domain):
+            raise InvalidAnswer('%s is not a valid ip or domain' % ip_or_domain)
+        return ip_or_domain
 
     def ask_server_ip_or_domain(self):
-        def validate(ip_or_domain):
-            if not re.match(self.SERVER_IP_OR_DOMAIN_REGEX, ip_or_domain):
-                raise InvalidAnswer('%s is not a valid ip or domain' % ip_or_domain)
-            return ip_or_domain
-
         question = 'What is the ip or domain of the server?'
         key = 'This server\'s ip or domain'
         note = 'For example: www.mycompany.com, 192.168.1.101'
         self.ip_or_domain = Utils.ask_question(question,
                                                key=key,
                                                note=note,
-                                               validate=validate)
+                                               validate=self.validate_server_ip)
 
     def ask_port(self):
         def validate(port):
@@ -816,20 +858,24 @@ class CcnetConfigurator(AbstractConfigurator):
 class SeafileConfigurator(AbstractConfigurator):
     def __init__(self):
         AbstractConfigurator.__init__(self)
-        self.seafile_dir = os.path.join(env_mgr.top_dir, 'seafile-data')
+        self.seafile_dir = None
         self.port = 12001
-        self.fileserver_port = 8082
+        self.fileserver_port = None
+        self.seafile_conf = os.path.join(env_mgr.central_config_dir, 'seafile.conf')
 
     def ask_questions(self):
-        self.ask_seafile_dir()
+        if not self.seafile_dir:
+            self.ask_seafile_dir()
         # self.ask_port()
-        self.ask_fileserver_port()
+        if not self.fileserver_port:
+            self.ask_fileserver_port()
 
     def generate(self):
         print 'Generating seafile configuration ...\n'
         seafserv_init = os.path.join(env_mgr.bin_dir, 'seaf-server-init')
         argv = [
             seafserv_init,
+            '-F', env_mgr.central_config_dir,
             '--seafile-dir', self.seafile_dir,
             '--fileserver-port', str(self.fileserver_port),
         ]
@@ -843,8 +889,7 @@ class SeafileConfigurator(AbstractConfigurator):
         print 'done'
 
     def generate_db_conf(self):
-        seafile_conf = os.path.join(self.seafile_dir, 'seafile.conf')
-        config = Utils.read_config(seafile_conf)
+        config = Utils.read_config(self.seafile_conf)
         # [database]
         # type=
         # host=
@@ -863,14 +908,14 @@ class SeafileConfigurator(AbstractConfigurator):
         config.set(db_section, 'db_name', db_config.seafile_db_name)
         config.set(db_section, 'connection_charset', 'utf8')
 
-        Utils.write_config(config, seafile_conf)
+        Utils.write_config(config, self.seafile_conf)
+
+    def validate_seafile_dir(self, path):
+        if os.path.exists(path):
+            raise InvalidAnswer('%s already exists' % Utils.highlight(path))
+        return path
 
     def ask_seafile_dir(self):
-        def validate(path):
-            if os.path.exists(path):
-                raise InvalidAnswer('%s already exists' % Utils.highlight(path))
-
-            return path
         question = 'Where do you want to put your seafile data?'
         key = 'seafile-data'
         note = 'Please use a volume with enough free space'
@@ -879,7 +924,7 @@ class SeafileConfigurator(AbstractConfigurator):
                                               key=key,
                                               note=note,
                                               default=default,
-                                              validate=validate)
+                                              validate=self.validate_seafile_dir)
 
     def ask_port(self):
         def validate(port):
@@ -898,25 +943,13 @@ class SeafileConfigurator(AbstractConfigurator):
                                        validate=validate)
 
     def ask_fileserver_port(self):
-        def validate(port):
-            port = Utils.validate_port(port)
-            if port == ccnet_config.port:
-                raise InvalidAnswer('%s is used by ccnet server, choose another one' \
-                                    % Utils.highlight(port))
-
-            if port == seafile_config.port:
-                raise InvalidAnswer('%s is used by seafile server, choose another one' \
-                                    % Utils.highlight(port))
-
-            return port
-
         question = 'Which port do you want to use for the seafile fileserver?'
         key = 'seafile fileserver port'
         default = 8082
         self.fileserver_port = Utils.ask_question(question,
                                                   key=key,
                                                   default=default,
-                                                  validate=validate)
+                                                  validate=Utils.validate_port)
 
     def write_seafile_ini(self):
         seafile_ini = os.path.join(ccnet_config.ccnet_dir, 'seafile.ini')
@@ -928,7 +961,7 @@ class SeahubConfigurator(AbstractConfigurator):
         AbstractConfigurator.__init__(self)
         self.admin_email = ''
         self.admin_password = ''
-        self.seahub_settings_py = os.path.join(env_mgr.top_dir, 'seahub_settings.py')
+        self.seahub_settings_py = os.path.join(env_mgr.central_config_dir, 'seahub_settings.py')
 
     def hashed_admin_password(self):
         return hashlib.sha1(self.admin_password).hexdigest() # pylint: disable=E1101
@@ -942,27 +975,26 @@ class SeahubConfigurator(AbstractConfigurator):
         '''Generating seahub_settings.py'''
         print 'Generating seahub configuration ...\n'
         time.sleep(1)
-        with open(self.seahub_settings_py, 'w') as fp:
-            self.write_secret_key(fp)
+        self.write_secret_key()
+        with open(self.seahub_settings_py, 'a') as fp:
             self.write_database_config(fp)
 
-    def write_secret_key(self, fp):
-        text = 'SECRET_KEY = "%s"\n\n' % self.gen_secret_key()
-        fp.write(text)
+    def write_secret_key(self):
+        Utils.run_argv([Utils.get_python_executable(),
+                        os.path.join(env_mgr.install_path, 'seahub',
+                                     'tools', 'secret_key_generator.py'),
+                        self.seahub_settings_py])
 
     def write_database_config(self, fp):
         template = '''\
-DATABASES = {
+\nDATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.mysql',
         'NAME': '%(name)s',
         'USER': '%(username)s',
         'PASSWORD': '%(password)s',
         'HOST': '%(host)s',
-        'PORT': '%(port)s',
-        'OPTIONS': {
-            'init_command': 'SET storage_engine=INNODB',
-        }
+        'PORT': '%(port)s'
     }
 }
 
@@ -974,10 +1006,6 @@ DATABASES = {
                                port=db_config.mysql_port)
 
         fp.write(text)
-
-    def gen_secret_key(self):
-        data = str(uuid.uuid4()) + str(uuid.uuid4())
-        return data[:40]
 
     def ask_admin_email(self):
         print
@@ -1087,18 +1115,13 @@ DATABASES = {
 class SeafDavConfigurator(AbstractConfigurator):
     def __init__(self):
         AbstractConfigurator.__init__(self)
-        self.conf_dir = None
         self.seafdav_conf = None
 
     def ask_questions(self):
         pass
 
     def generate(self):
-        self.conf_dir = os.path.join(env_mgr.top_dir, 'conf')
-        if not os.path.exists('conf'):
-            Utils.must_mkdir(self.conf_dir)
-
-        self.seafdav_conf = os.path.join(self.conf_dir, 'seafdav.conf')
+        self.seafdav_conf = os.path.join(env_mgr.central_config_dir, 'seafdav.conf')
         text = '''
 [WEBDAV]
 enabled = false
@@ -1155,7 +1178,7 @@ def report_config():
         'admin_email' :         seahub_config.admin_email,
 
 
-        'use_existing_db':       'use exising' if db_config.use_existing_db else 'create new',
+        'use_existing_db':       'use existing' if db_config.use_existing_db else 'create new',
         'ccnet_db_name':        db_config.ccnet_db_name,
         'seafile_db_name':      db_config.seafile_db_name,
         'seahub_db_name':       db_config.seahub_db_name,
@@ -1164,12 +1187,13 @@ def report_config():
 
     print template % config
 
-    print
-    print '---------------------------------'
-    print 'Press ENTER to continue, or Ctrl-C to abort'
-    print '---------------------------------'
+    if need_pause:
+        print
+        print '---------------------------------'
+        print 'Press ENTER to continue, or Ctrl-C to abort'
+        print '---------------------------------'
 
-    raw_input()
+        raw_input()
 
 
 def create_seafile_server_symlink():
@@ -1187,13 +1211,13 @@ def set_file_perm():
     filemode = 0600
     dirmode = 0700
     files = [
-        os.path.join(env_mgr.top_dir, 'seahub_settings.py'),
+        seahub_config.seahub_settings_py,
     ]
     dirs = [
+        env_mgr.central_config_dir,
         ccnet_config.ccnet_dir,
         seafile_config.seafile_dir,
         seahub_config.seahub_settings_py,
-        seafdav_config.conf_dir,
     ]
     for fpath in files:
         os.chmod(fpath, filemode)
@@ -1208,11 +1232,144 @@ seahub_config = SeahubConfigurator()
 user_manuals_handler = UserManualHandler()
 # Would be created after AbstractDBConfigurator.ask_use_existing_db()
 db_config = None
+need_pause = True
 
-def main():
+def get_param_val(arg, env, default=None):
+    return arg or os.environ.get(env, default)
+
+def check_params(args):
+    host_name = socket.gethostname()
+    if len(host_name) > 15:
+        host_name = host_name[0:15]
+    server_name = get_param_val(args.server_name, 'SERVER_NAME', host_name)
+    ccnet_config.server_name = ccnet_config.validate_server_name(server_name)
+
+    server_ip = get_param_val(args.server_ip, 'SERVER_IP',
+                              socket.gethostbyname(socket.gethostname()))
+    ccnet_config.ip_or_domain = ccnet_config.validate_server_ip(server_ip)
+
+    fileserver_port = get_param_val(args.fileserver_port, 'FILESERVER_PORT', '8082')
+    seafile_config.fileserver_port = Utils.validate_port(fileserver_port)
+
+    seafile_dir = get_param_val(args.seafile_dir, 'SEAFILE_DIR',
+                                os.path.join(env_mgr.top_dir, 'seafile-data'))
+    seafile_config.seafile_dir = seafile_config.validate_seafile_dir(seafile_dir)
+
     global db_config
 
-    Utils.welcome()
+    use_existing_db = get_param_val(args.use_existing_db, 'USE_EXISTING_DB', '0')
+    if use_existing_db == '0':
+        db_config = NewDBConfigurator()
+    elif use_existing_db == '1':
+        db_config = ExistingDBConfigurator()
+    else:
+        raise InvalidParams('Invalid use existing db parameter, the value can only be 0 or 1')
+
+    mysql_host = get_param_val(args.mysql_host, 'MYSQL_HOST', '127.0.0.1')
+    if not mysql_host:
+        raise InvalidParams('Incomplete mysql configuration parameters, ' \
+                            'missing mysql host parameter')
+    db_config.mysql_host = db_config.validate_mysql_host(mysql_host)
+
+    mysql_port = get_param_val(args.mysql_port, 'MYSQL_PORT', '3306')
+    db_config.mysql_port = Utils.validate_port(mysql_port)
+
+    mysql_user = get_param_val(args.mysql_user, 'MYSQL_USER')
+    if not mysql_user:
+        raise InvalidParams('Incomplete mysql configuration parameters, ' \
+                            'missing mysql user name parameter')
+
+    mysql_user_passwd = get_param_val(args.mysql_user_passwd, 'MYSQL_USER_PASSWD')
+    if not mysql_user_passwd:
+        raise InvalidParams('Incomplete mysql configuration parameters, ' \
+                            'missing mysql user password parameter')
+
+    ccnet_db = get_param_val(args.ccnet_db, 'CCNET_DB', 'ccnet_db')
+    if not ccnet_db:
+        raise InvalidParams('Incomplete mysql configuration parameters, ' \
+                            'missing ccnet db name parameter')
+
+    seafile_db = get_param_val(args.seafile_db, 'SEAFILE_DB', 'seafile_db')
+    if not seafile_db:
+        raise InvalidParams('Incomplete mysql configuration parameters, ' \
+                            'missing seafile db name parameter')
+
+    seahub_db = get_param_val(args.seahub_db, 'SEAHUB_DB', 'seahub_db')
+    if not seahub_db:
+        raise InvalidParams('Incomplete mysql configuration parameters, ' \
+                            'missing seahub db name parameter')
+
+    mysql_user_host = get_param_val(args.mysql_user_host, 'MYSQL_USER_HOST')
+    mysql_root_passwd = get_param_val(args.mysql_root_passwd, 'MYSQL_ROOT_PASSWD')
+
+    if db_config.use_existing_db:
+        db_config.check_mysql_user(mysql_user, mysql_user_passwd)
+        db_config.seafile_mysql_user = mysql_user
+        db_config.seafile_mysql_password = mysql_user_passwd
+        db_config.ccnet_db_name = db_config.validate_db_name(ccnet_db)
+        db_config.seafile_db_name = db_config.validate_db_name(seafile_db)
+        db_config.seahub_db_name = db_config.validate_db_name(seahub_db)
+    else:
+        if db_config.mysql_host != '127.0.0.1' and not mysql_user_host:
+            raise InvalidParams('mysql user host parameter is missing in creating new db mode')
+        if not mysql_user_host:
+            db_config.mysql_userhost = 'localhost'
+        else:
+            db_config.mysql_userhost = db_config.validate_mysql_user_host(mysql_user_host)
+
+        if not mysql_root_passwd:
+            raise InvalidParams('mysql root password parameter is missing in creating new db mode')
+        db_config.root_password = db_config.validate_root_passwd(mysql_root_passwd)
+
+        if mysql_user == 'root':
+            db_config.seafile_mysql_user = 'root'
+            db_config.seafile_mysql_password = db_config.root_password
+        else:
+            if db_config.mysql_user_exists(mysql_user):
+                db_config.check_mysql_user(mysql_user, mysql_user_passwd)
+            db_config.seafile_mysql_user = mysql_user
+            db_config.seafile_mysql_password = mysql_user_passwd
+        db_config.ccnet_db_name = ccnet_db
+        db_config.seafile_db_name = seafile_db
+        db_config.seahub_db_name = seahub_db
+
+    global need_pause
+    need_pause = False
+
+
+def main():
+    if len(sys.argv) > 2 and sys.argv[1] == 'auto':
+        sys.argv.remove('auto')
+        parser = argparse.ArgumentParser()
+        parser.add_argument('-n', '--server-name', help='server name')
+        parser.add_argument('-i', '--server-ip', help='server ip or domain')
+        parser.add_argument('-p', '--fileserver-port', help='fileserver port')
+        parser.add_argument('-d', '--seafile-dir', help='seafile dir to store seafile data')
+        parser.add_argument('-e', '--use-existing-db',
+                            help='use mysql existing dbs or create new dbs, '
+                            '0: create new dbs 1: use existing dbs')
+        parser.add_argument('-o', '--mysql-host', help='mysql host')
+        parser.add_argument('-t', '--mysql-port', help='mysql port')
+        parser.add_argument('-u', '--mysql-user', help='mysql user name')
+        parser.add_argument('-w', '--mysql-user-passwd', help='mysql user password')
+        parser.add_argument('-q', '--mysql-user-host', help='mysql user host')
+        parser.add_argument('-r', '--mysql-root-passwd', help='mysql root password')
+        parser.add_argument('-c', '--ccnet-db', help='ccnet db name')
+        parser.add_argument('-s', '--seafile-db', help='seafile db name')
+        parser.add_argument('-b', '--seahub-db', help='seahub db name')
+
+        args = parser.parse_args()
+
+        try:
+            check_params(args)
+        except (InvalidAnswer, InvalidParams) as e:
+            print Utils.highlight('\n%s\n' % e)
+            sys.exit(-1)
+
+    global db_config
+
+    if need_pause:
+        Utils.welcome()
     warnings.filterwarnings('ignore', category=MySQLdb.Warning)
 
     env_mgr.check_pre_condiction()
@@ -1222,12 +1379,13 @@ def main():
     seafile_config.ask_questions()
     seahub_config.ask_questions()
 
-    if AbstractDBConfigurator.ask_use_existing_db():
-        db_config = ExistingDBConfigurator()
-    else:
-        db_config = NewDBConfigurator()
+    if not db_config:
+        if AbstractDBConfigurator.ask_use_existing_db():
+            db_config = ExistingDBConfigurator()
+        else:
+            db_config = NewDBConfigurator()
 
-    db_config.ask_questions()
+        db_config.ask_questions()
 
     report_config()
 

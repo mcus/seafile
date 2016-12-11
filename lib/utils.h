@@ -3,6 +3,13 @@
 #ifndef CCNET_UTILS_H
 #define CCNET_UTILS_H
 
+#ifdef WIN32
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x500
+#endif
+#include <windows.h>
+#endif
+
 #include <sys/time.h>
 #include <time.h>
 #include <stdint.h>
@@ -39,6 +46,7 @@
 #define ccnet_pipe_t intptr_t
 
 int pgpipe (ccnet_pipe_t handles[2]);
+/* Should only be called in main loop. */
 #define ccnet_pipe(a) pgpipe((a))
 #define piperead(a,b,c) recv((a),(b),(c),0)
 #define pipewrite(a,b,c) send((a),(b),(c),0)
@@ -79,6 +87,9 @@ win32_long_path (const char *path);
 /* Convert a (possible) 8.3 format path to long path */
 wchar_t *
 win32_83_path_to_long_path (const char *worktree, const wchar_t *path, int path_len);
+
+__time64_t
+file_time_to_unix_time (FILETIME *ftime);
 #endif
 
 int
@@ -158,6 +169,8 @@ char* gen_uuid ();
 void gen_uuid_inplace (char *buf);
 gboolean is_uuid_valid (const char *uuid_str);
 
+gboolean
+is_object_id_valid (const char *obj_id);
 
 /* dir operations */
 int checkdir (const char *dir);
@@ -372,6 +385,9 @@ json_object_set_int_member (json_t *object, const char *key, gint64 value);
 void
 clean_utf8_data (char *data, int len);
 
+char *
+normalize_utf8_path (const char *path);
+
 /* zlib related functions. */
 
 int
@@ -379,5 +395,14 @@ seaf_compress (guint8 *input, int inlen, guint8 **output, int *outlen);
 
 int
 seaf_decompress (guint8 *input, int inlen, guint8 **output, int *outlen);
+
+char*
+format_dir_path (const char *path);
+
+gboolean
+is_empty_string (const char *str);
+
+gboolean
+is_permission_valid (const char *perm);
 
 #endif

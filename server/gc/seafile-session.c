@@ -13,9 +13,12 @@
 #include "log.h"
 
 SeafileSession *
-seafile_session_new(const char *seafile_dir,
-                    CcnetClient *ccnet_session)
+seafile_session_new(const char *central_config_dir,
+                    const char *seafile_dir,
+                    CcnetClient *ccnet_session,
+                    gboolean need_db)
 {
+    char *abs_central_config_dir = NULL;
     char *abs_seafile_dir;
     char *tmp_file_dir;
     char *config_file_path;
@@ -28,7 +31,17 @@ seafile_session_new(const char *seafile_dir,
 
     abs_seafile_dir = ccnet_expand_path (seafile_dir);
     tmp_file_dir = g_build_filename (abs_seafile_dir, "tmpfiles", NULL);
-    config_file_path = g_build_filename (abs_seafile_dir, "seafile.conf", NULL);
+    if (central_config_dir) {
+        abs_central_config_dir = ccnet_expand_path (central_config_dir);
+    }
+    const char *confdir = abs_central_config_dir ? abs_central_config_dir : abs_seafile_dir;
+    config_file_path = g_build_filename(confdir, "seafile.conf", NULL);
+
+    if (g_stat(confdir, &st) < 0 || !S_ISDIR(st.st_mode)) {
+        seaf_warning ("Config dir dir %s does not exist\n",
+                   abs_seafile_dir);
+        goto onerror;
+    }
 
     if (g_stat(abs_seafile_dir, &st) < 0 || !S_ISDIR(st.st_mode)) {
         seaf_warning ("Seafile data dir %s does not exist\n",
@@ -57,9 +70,11 @@ seafile_session_new(const char *seafile_dir,
     session->session = ccnet_session;
     session->config = config;
 
-    if (load_database_config (session) < 0) {
-        seaf_warning ("Failed to load database config.\n");
-        goto onerror;
+    if (need_db) {
+        if (load_database_config (session) < 0) {
+            seaf_warning ("Failed to load database config.\n");
+            goto onerror;
+        }
     }
 
     session->fs_mgr = seaf_fs_manager_new (session, abs_seafile_dir);

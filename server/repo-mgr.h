@@ -7,17 +7,6 @@
 #include "commit-mgr.h"
 #include "branch-mgr.h"
 
-#define REPO_AUTO_SYNC        "auto-sync"
-#define REPO_AUTO_FETCH       "auto-fetch"
-#define REPO_AUTO_UPLOAD      "auto-upload"
-#define REPO_AUTO_MERGE       "auto-merge"
-#define REPO_AUTO_COMMIT      "auto-commit"
-#define REPO_RELAY_ID         "relay-id"
-#define REPO_NET_BROWSABLE    "net-browsable"
-#define REPO_DOUBLE_SYNC      "double-sync"
-#define REPO_REMOTE_HEAD      "remote-head"
-#define REPO_ENCRYPTED 0x1
-
 struct _SeafRepoManager;
 typedef struct _SeafRepo SeafRepo;
 
@@ -41,6 +30,7 @@ struct _SeafRepo {
     gboolean    no_local_history;
     gint64      last_modify;
     gint64      size;
+    gint64      file_count;
 
     SeafBranch *head;
     gchar root_id[41];
@@ -210,13 +200,15 @@ seaf_repo_manager_add_token_peer_info (SeafRepoManager *mgr,
                                        const char *peer_id,
                                        const char *peer_ip,
                                        const char *peer_name,
-                                       gint64 sync_time);
+                                       gint64 sync_time,
+                                       const char *client_ver);
 
 int
 seaf_repo_manager_update_token_peer_info (SeafRepoManager *mgr,
                                           const char *token,
                                           const char *peer_ip,
-                                          gint64 sync_time);
+                                          gint64 sync_time,
+                                          const char *client_ver);
 
 gboolean
 seaf_repo_manager_token_peer_info_exists (SeafRepoManager *mgr,
@@ -337,6 +329,25 @@ seaf_repo_manager_post_file_blocks (SeafRepoManager *mgr,
                                     int replace_existed,
                                     char **new_id,
                                     GError **error);
+int
+seaf_repo_manager_post_blocks (SeafRepoManager *mgr,
+                               const char *repo_id,
+                               const char *blockids_json,
+                               const char *paths_json,
+                               const char *user,
+                               GError **error);
+
+int
+seaf_repo_manager_commit_file_blocks (SeafRepoManager *mgr,
+                                      const char *repo_id,
+                                      const char *parent_dir,
+                                      const char *file_name,
+                                      const char *blockids_json,
+                                      const char *user,
+                                      gint64 file_size,
+                                      int replace_existed,
+                                      char **new_id,
+                                      GError **error);
 
 int
 seaf_repo_manager_post_empty_file (SeafRepoManager *mgr,
@@ -414,6 +425,7 @@ seaf_repo_manager_move_file (SeafRepoManager *mgr,
                              const char *dst_repo_id,
                              const char *dst_dir,
                              const char *dst_filename,
+                             int replace,
                              const char *user,
                              int need_progress,
                              int synchronous,
@@ -498,6 +510,8 @@ seaf_repo_manager_get_deleted_entries (SeafRepoManager *mgr,
                                        const char *repo_id,
                                        int show_days,
                                        const char *path,
+                                       const char *scan_stat,
+                                       int limit,
                                        GError **error);
 
 /*
@@ -537,7 +551,8 @@ seaf_repo_manager_get_orphan_repo_list (SeafRepoManager *mgr);
  */
 GList *
 seaf_repo_manager_get_repos_by_owner (SeafRepoManager *mgr,
-                                      const char *email);
+                                      const char *email,
+                                      int ret_corrupted);
 
 GList *
 seaf_repo_manager_get_repo_ids_by_owner (SeafRepoManager *mgr,
@@ -751,5 +766,4 @@ seaf_repo_manager_get_shared_groups_for_subdir (SeafRepoManager *mgr,
                                                 const char *path,
                                                 const char *from_user,
                                                 GError **error);
-
 #endif

@@ -29,7 +29,6 @@
 #include "mq-mgr.h"
 #include "seafile-config.h"
 
-#include "processors/check-tx-v2-proc.h"
 #include "processors/check-tx-v3-proc.h"
 #include "processors/sendfs-proc.h"
 #include "processors/getfs-proc.h"
@@ -446,10 +445,6 @@ seaf_transfer_manager_new (struct _SeafileSession *seaf)
 static void register_processors (CcnetClient *client)
 {
     ccnet_proc_factory_register_processor (client->proc_factory,
-                                           "seafile-check-tx-v2",
-                                           SEAFILE_TYPE_CHECK_TX_V2_PROC);
-
-    ccnet_proc_factory_register_processor (client->proc_factory,
                                            "seafile-check-tx-v3",
                                            SEAFILE_TYPE_CHECK_TX_V3_PROC);
 
@@ -828,7 +823,7 @@ retry:
     block_tx_client_run_command (info, BLOCK_CLIENT_CMD_TRANSFER);
 
     /* Wait until block download is done. */
-    piperead (info->done_pipe[0], &rsp, sizeof(rsp));
+    piperead (info->done_pipe[0], (char*)&rsp, sizeof(rsp));
 
     /* The server closes the socket after 30 seconds without data,
      * so just retry if we encounter network error.
@@ -836,7 +831,7 @@ retry:
     if (rsp == BLOCK_CLIENT_NET_ERROR) {
         block_tx_client_run_command (info, BLOCK_CLIENT_CMD_RESTART);
 
-        piperead (info->done_pipe[0], &rsp, sizeof(rsp));
+        piperead (info->done_pipe[0], (char*)&rsp, sizeof(rsp));
         if (rsp == BLOCK_CLIENT_READY)
             goto retry;
     }
@@ -1075,8 +1070,9 @@ static int
 load_blocklist_v2 (TransferTask *task)
 {
     int ret = 0;
-
     SeafBranch *local = NULL, *master = NULL;
+    SeafCommit *local_head = NULL, *master_head = NULL;
+
     local = seaf_branch_manager_get_branch (seaf->branch_mgr, task->repo_id, "local");
     if (!local) {
         seaf_warning ("Branch local not found for repo %.8s.\n", task->repo_id);
@@ -1090,7 +1086,6 @@ load_blocklist_v2 (TransferTask *task)
         goto out;
     }
 
-    SeafCommit *local_head = NULL, *master_head = NULL;
     local_head = seaf_commit_manager_get_commit (seaf->commit_mgr,
                                                  task->repo_id, task->repo_version,
                                                  local->commit_id);
@@ -1381,14 +1376,14 @@ download_and_checkout_files_thread (void *vdata)
     TransferTask *task = data->task;
     int rsp;
 
-    piperead (task->tx_info->done_pipe[0], &rsp, sizeof(rsp));
+    piperead (task->tx_info->done_pipe[0], (char*)&rsp, sizeof(rsp));
 
     if (rsp == BLOCK_CLIENT_READY) {
         data->status = seaf_repo_fetch_and_checkout (task, NULL, FALSE, task->head);
 
         block_tx_client_run_command (task->tx_info, BLOCK_CLIENT_CMD_END);
 
-        piperead (task->tx_info->done_pipe[0], &rsp, sizeof(rsp));
+        piperead (task->tx_info->done_pipe[0], (char*)&rsp, sizeof(rsp));
     } else
         /* block-tx-client thread should have exited. */
         data->status = FETCH_CHECKOUT_FAILED;

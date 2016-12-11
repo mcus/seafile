@@ -16,7 +16,6 @@
 #include "seafile-rpc.h"
 
 #ifdef SEAFILE_SERVER
-#include "monitor-rpc-wrappers.h"
 #include "web-accesstoken-mgr.h"
 #endif
 
@@ -24,6 +23,7 @@
 #include "seafile-config.h"
 #endif
 
+#define DEBUG_FLAG SEAFILE_DEBUG_OTHER
 #include "log.h"
 
 #ifndef SEAFILE_SERVER
@@ -76,7 +76,7 @@ convert_repo (SeafRepo *r)
 
     g_object_set (repo, "store_id", r->store_id,
                   "repaired", r->repaired,
-                  "size", r->size, NULL);
+                  "size", r->size, "file_count", r->file_count, NULL);
 #endif
 
 #ifndef SEAFILE_SERVER
@@ -118,25 +118,6 @@ convert_repo_list (GList *inner_repos)
     }
 
     return g_list_reverse (ret);
-}
-
-static char*
-format_dir_path (const char *path)
-{
-    int path_len = strlen (path);
-    char *rpath;
-    if (path[0] != '/') {
-        rpath = g_strconcat ("/", path, NULL);
-        path_len++;
-    } else {
-        rpath = g_strdup (path);
-    }
-    while (path_len > 1 && rpath[path_len-1] == '/') {
-        rpath[path_len-1] = '\0';
-        path_len--;
-    }
-
-    return rpath;
 }
 
 /*
@@ -518,6 +499,10 @@ convert_http_task (HttpTxTask *task)
                           "block_done", task->done_files,
                           NULL);
             g_object_set (t, "rate", http_tx_task_get_rate(task), NULL);
+        } else if (task->runtime_state == HTTP_TASK_RT_STATE_FS) {
+            g_object_set (t, "fs_objects_total", task->n_fs_objs,
+                          "fs_objects_done", task->done_fs_objs,
+                          NULL);
         }
     } else {
         g_object_set (t, "ttype", "upload", NULL);
@@ -898,7 +883,7 @@ seafile_mark_file_locked (const char *repo_id, const char *path, GError **error)
         canon_path[len-1] = 0;
 
     ret = seaf_filelock_manager_mark_file_locked (seaf->filelock_mgr,
-                                                  repo_id, path);
+                                                  repo_id, path, FALSE);
 
     g_free (canon_path);
     return ret;
@@ -934,6 +919,37 @@ seafile_mark_file_unlocked (const char *repo_id, const char *path, GError **erro
 
     g_free (canon_path);
     return ret;
+}
+
+char *
+seafile_get_server_property (const char *server_url, const char *key, GError **error)
+{
+    if (!server_url || !key) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Argument should not be null");
+        return NULL;
+    }
+
+    return seaf_repo_manager_get_server_property (seaf->repo_mgr,
+                                                  server_url,
+                                                  key);
+}
+
+int
+seafile_set_server_property (const char *server_url,
+                             const char *key,
+                             const char *value,
+                             GError **error)
+{
+    if (!server_url || !key || !value) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Argument should not be null");
+        return -1;
+    }
+
+    return seaf_repo_manager_set_server_property (seaf->repo_mgr,
+                                                  server_url,
+                                                  key, value);
 }
 
 #endif  /* not define SEAFILE_SERVER */
@@ -1117,6 +1133,7 @@ convert_to_seafile_commit (SeafCommit *c)
                   "version", c->version,
                   "new_merge", c->new_merge,
                   "conflict", c->conflict,
+                  "device_name", c->device_name,
                   NULL);
     return commit;
 }
@@ -1127,6 +1144,16 @@ seafile_get_commit (const char *repo_id, int version,
 {
     SeafileCommit *commit;
     SeafCommit *c;
+
+    if (!repo_id || !is_uuid_valid(repo_id)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Invalid repo id");
+        return NULL;
+    }
+
+    if (!id || !is_object_id_valid(id)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Invalid commit id");
+        return NULL;
+    }
 
     c = seaf_commit_manager_get_commit (seaf->commit_mgr, repo_id, version, id);
     if (!c)
@@ -1283,7 +1310,7 @@ int do_unsync_repo(SeafRepo *repo)
         return -1;
     }
 
-    if (repo->auto_sync)
+    if (repo->auto_sync && (repo->sync_interval == 0))
         seaf_wt_monitor_unwatch_repo (seaf->wt_monitor, repo->id);
 
     seaf_sync_manager_cancel_sync_task (seaf->sync_mgr, repo->id);
@@ -1490,6 +1517,89 @@ seafile_generate_magic_and_random_key(int enc_version,
 
 }
 
+#include "diff-simple.h"
+
+inline static const char*
+get_diff_status_str(char status)
+{
+    if (status == DIFF_STATUS_ADDED)
+        return "add";
+    if (status == DIFF_STATUS_DELETED)
+        return "del";
+    if (status == DIFF_STATUS_MODIFIED)
+        return "mod";
+    if (status == DIFF_STATUS_RENAMED)
+        return "mov";
+    if (status == DIFF_STATUS_DIR_ADDED)
+        return "newdir";
+    if (status == DIFF_STATUS_DIR_DELETED)
+        return "deldir";
+    return NULL;
+}
+
+GList *
+seafile_diff (const char *repo_id, const char *arg1, const char *arg2, int fold_dir_diff, GError **error)
+{
+    SeafRepo *repo;
+    char *err_msgs = NULL;
+    GList *diff_entries, *p;
+    GList *ret = NULL;
+
+    if (!repo_id || !arg1 || !arg2) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Argument should not be null");
+        return NULL;
+    }
+
+    if (!is_uuid_valid (repo_id)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Invalid repo id");
+        return NULL;
+    }
+
+    if ((arg1[0] != 0 && !is_object_id_valid (arg1)) || !is_object_id_valid(arg2)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Invalid commit id");
+        return NULL;
+    }
+
+    repo = seaf_repo_manager_get_repo (seaf->repo_mgr, repo_id);
+    if (!repo) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "No such repository");
+        return NULL;
+    }
+
+    diff_entries = seaf_repo_diff (repo, arg1, arg2, fold_dir_diff, &err_msgs);
+    if (err_msgs) {
+        g_set_error (error, SEAFILE_DOMAIN, -1, "%s", err_msgs);
+        g_free (err_msgs);
+#ifdef SEAFILE_SERVER
+        seaf_repo_unref (repo);
+#endif
+        return NULL;
+    }
+
+#ifdef SEAFILE_SERVER
+    seaf_repo_unref (repo);
+#endif
+
+    for (p = diff_entries; p != NULL; p = p->next) {
+        DiffEntry *de = p->data;
+        SeafileDiffEntry *entry = g_object_new (
+            SEAFILE_TYPE_DIFF_ENTRY,
+            "status", get_diff_status_str(de->status),
+            "name", de->name,
+            "new_name", de->new_name,
+            NULL);
+        ret = g_list_prepend (ret, entry);
+    }
+
+    for (p = diff_entries; p != NULL; p = p->next) {
+        DiffEntry *de = p->data;
+        diff_entry_free (de);
+    }
+    g_list_free (diff_entries);
+
+    return g_list_reverse (ret);
+}
+
 /*
  * RPC functions only available for server.
  */
@@ -1510,12 +1620,21 @@ seafile_list_dir_by_path(const char *repo_id,
     GList *ptr;
     GList *res = NULL;
 
-    char *p = g_strdup(path);
-    int len = strlen(p);
-
-    if (!repo_id || !is_uuid_valid (repo_id) || !commit_id || !path) {
+    if (!repo_id || !commit_id || !path) {
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
                      "Args can't be NULL");
+        return NULL;
+    }
+
+    if (!is_uuid_valid (repo_id)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid repo id");
+        return NULL;
+    }
+
+    if (!is_object_id_valid (commit_id)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid commit id");
         return NULL;
     }
 
@@ -1549,6 +1668,10 @@ seafile_list_dir_by_path(const char *repo_id,
 
     for (ptr = dir->entries; ptr != NULL; ptr = ptr->next) {
         dent = ptr->data;
+
+        if (!is_object_id_valid (dent->id))
+            continue;
+
         d = g_object_new (SEAFILE_TYPE_DIRENT,
                           "obj_id", dent->id,
                           "obj_name", dent->name,
@@ -1570,7 +1693,8 @@ out:
 }
 
 static void
-filter_error (GError **error) {
+filter_error (GError **error)
+{
     if (*error && g_error_matches(*error,
                                   SEAFILE_DOMAIN,
                                   SEAF_ERR_PATH_NO_EXIST)) {
@@ -1579,20 +1703,33 @@ filter_error (GError **error) {
 }
 
 char *
-seafile_get_dirid_by_path(const char *repo_id,
-                          const char *commit_id, const char *path, GError **error)
+seafile_get_dir_id_by_commit_and_path(const char *repo_id,
+                                      const char *commit_id,
+                                      const char *path,
+                                      GError **error)
 {
     SeafRepo *repo = NULL;
     char *res = NULL;
     SeafCommit *commit = NULL;
     SeafDir *dir;
 
-    if (!repo_id || !is_uuid_valid(repo_id) || !commit_id || !path) {
+    if (!repo_id || !commit_id || !path) {
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
                      "Args can't be NULL");
         return NULL;
     }
 
+    if (!is_uuid_valid (repo_id)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid repo id");
+        return NULL;
+    }
+
+    if (!is_object_id_valid (commit_id)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid commit id");
+        return NULL;
+    }
 
     repo = seaf_repo_manager_get_repo (seaf->repo_mgr, repo_id);
     if (!repo) {
@@ -1841,84 +1978,6 @@ out:
     return ret;
 }
 
-#include "diff-simple.h"
-
-inline static const char*
-get_diff_status_str(char status)
-{
-    if (status == DIFF_STATUS_ADDED)
-        return "add";
-    if (status == DIFF_STATUS_DELETED)
-        return "del";
-    if (status == DIFF_STATUS_MODIFIED)
-        return "mod";
-    if (status == DIFF_STATUS_RENAMED)
-        return "mov";
-    if (status == DIFF_STATUS_DIR_ADDED)
-        return "newdir";
-    if (status == DIFF_STATUS_DIR_DELETED)
-        return "deldir";
-    return NULL;
-}
-
-GList *
-seafile_diff (const char *repo_id, const char *arg1, const char *arg2, int fold_dir_diff, GError **error)
-{
-    SeafRepo *repo;
-    char *err_msgs = NULL;
-    GList *diff_entries, *p;
-    GList *ret = NULL;
-
-    if (!repo_id || !arg1 || !arg2) {
-        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Argument should not be null");
-        return NULL;
-    }
-
-    if (!is_uuid_valid (repo_id)) {
-        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Invalid repo id");
-        return NULL;
-    }
-
-    repo = seaf_repo_manager_get_repo (seaf->repo_mgr, repo_id);
-    if (!repo) {
-        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "No such repository");
-        return NULL;
-    }
-
-    diff_entries = seaf_repo_diff (repo, arg1, arg2, fold_dir_diff, &err_msgs);
-    if (err_msgs) {
-        g_set_error (error, SEAFILE_DOMAIN, -1, "%s", err_msgs);
-        g_free (err_msgs);
-#ifdef SEAFILE_SERVER
-        seaf_repo_unref (repo);
-#endif
-        return NULL;
-    }
-
-#ifdef SEAFILE_SERVER
-    seaf_repo_unref (repo);
-#endif
-
-    for (p = diff_entries; p != NULL; p = p->next) {
-        DiffEntry *de = p->data;
-        SeafileDiffEntry *entry = g_object_new (
-            SEAFILE_TYPE_DIFF_ENTRY,
-            "status", get_diff_status_str(de->status),
-            "name", de->name,
-            "new_name", de->new_name,
-            NULL);
-        ret = g_list_prepend (ret, entry);
-    }
-
-    for (p = diff_entries; p != NULL; p = p->next) {
-        DiffEntry *de = p->data;
-        diff_entry_free (de);
-    }
-    g_list_free (diff_entries);
-
-    return g_list_reverse (ret);
-}
-
 int
 seafile_is_repo_owner (const char *email,
                        const char *repo_id,
@@ -1998,14 +2057,14 @@ seafile_get_orphan_repo_list(GError **error)
 }
 
 GList *
-seafile_list_owned_repos (const char *email, GError **error)
+seafile_list_owned_repos (const char *email, int ret_corrupted, GError **error)
 {
     GList *ret = NULL;
     GList *repos, *ptr;
     char *repo_id = NULL;
     int is_shared;
 
-    repos = seaf_repo_manager_get_repos_by_owner (seaf->repo_mgr, email);
+    repos = seaf_repo_manager_get_repos_by_owner (seaf->repo_mgr, email, ret_corrupted);
     ret = convert_repo_list (repos);
 
     for (ptr = ret; ptr; ptr = ptr->next) {
@@ -2276,7 +2335,7 @@ seafile_web_get_access_token (const char *repo_id,
 
     token = seaf_web_at_manager_get_access_token (seaf->web_at_mgr,
                                                   repo_id, obj_id, op,
-                                                  username, use_onetime);
+                                                  username, use_onetime, error);
     return token;
 }
 
@@ -2299,6 +2358,13 @@ seafile_web_query_access_token (const char *token, GError **error)
     return NULL;
 }
 
+char *
+seafile_query_zip_progress (const char *token, GError **error)
+{
+    return zip_download_mgr_query_zip_progress (seaf->zip_download_mgr,
+                                                token, error);
+}
+
 int
 seafile_add_share (const char *repo_id, const char *from_email,
                    const char *to_email, const char *permission, GError **error)
@@ -2310,9 +2376,21 @@ seafile_add_share (const char *repo_id, const char *from_email,
         return -1;
     }
 
+    if (!is_uuid_valid (repo_id)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid repo_id parameter");
+        return -1;
+    }
+
     if (g_strcmp0 (from_email, to_email) == 0) {
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
                      "Can not share repo to myself");
+        return -1;
+    }
+
+    if (!is_permission_valid (permission)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid permission parameter");
         return -1;
     }
 
@@ -2356,6 +2434,208 @@ seafile_list_repo_shared_to (const char *from_user, const char *repo_id,
     return seaf_share_manager_list_repo_shared_to (seaf->share_mgr,
                                                    from_user, repo_id,
                                                    error);
+}
+
+int
+seafile_share_subdir_to_user (const char *repo_id,
+                              const char *path,
+                              const char *owner,
+                              const char *share_user,
+                              const char *permission,
+                              const char *passwd,
+                              GError **error)
+{
+    if (is_empty_string (repo_id) || !is_uuid_valid (repo_id)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid repo_id parameter");
+        return -1;
+    }
+
+    if (is_empty_string (path) || strcmp (path, "/") == 0) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid path parameter");
+        return -1;
+    }
+
+    if (is_empty_string (owner)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid owner parameter");
+        return -1;
+    }
+
+    if (is_empty_string (share_user)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid share_user parameter");
+        return -1;
+    }
+
+    if (strcmp (owner, share_user) == 0) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Can't share subdir to myself");
+        return -1;
+    }
+
+    if (!is_permission_valid (permission)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid permission parameter");
+        return -1;
+    }
+
+    char *real_path;
+    char *vrepo_name;
+    char *vrepo_id;
+    int ret = 0;
+
+    real_path = format_dir_path (path);
+    // Use subdir name as virtual repo name and description
+    vrepo_name = g_path_get_basename (real_path);
+    vrepo_id = seaf_repo_manager_create_virtual_repo (seaf->repo_mgr,
+                                                      repo_id, real_path,
+                                                      vrepo_name, vrepo_name,
+                                                      owner, passwd, error);
+    if (!vrepo_id) {
+        ret = -1;
+        goto out;
+    }
+
+    ret = seaf_share_manager_add_share (seaf->share_mgr, vrepo_id, owner,
+                                        share_user, permission);
+    if (ret < 0) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
+                     "Failed to share subdir to user");
+    }
+    g_free (vrepo_id);
+
+out:
+    g_free (vrepo_name);
+    g_free (real_path);
+    return ret;
+}
+
+int
+seafile_unshare_subdir_for_user (const char *repo_id,
+                                 const char *path,
+                                 const char *owner,
+                                 const char *share_user,
+                                 GError **error)
+{
+    if (is_empty_string (repo_id) || !is_uuid_valid (repo_id)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid repo_id parameter");
+        return -1;
+    }
+
+    if (is_empty_string (path) || strcmp (path, "/") == 0) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid path parameter");
+        return -1;
+    }
+
+    if (is_empty_string (owner)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid owner parameter");
+        return -1;
+    }
+
+    if (is_empty_string (share_user) ||
+        strcmp (owner, share_user) == 0) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid share_user parameter");
+        return -1;
+    }
+
+    char *real_path;
+    char *vrepo_id;
+    int ret = 0;
+
+    real_path = format_dir_path (path);
+
+    vrepo_id = seaf_repo_manager_get_virtual_repo_id (seaf->repo_mgr, repo_id,
+                                                      real_path, owner);
+    if (!vrepo_id) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
+                     "Failed to get shared sub repo");
+        ret = -1;
+        goto out;
+    }
+
+    ret = seaf_share_manager_remove_share (seaf->share_mgr, vrepo_id, owner, share_user);
+    if (ret < 0) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
+                     "Failed to unshare subdir for user");
+    }
+    g_free (vrepo_id);
+
+out:
+    g_free (real_path);
+    return ret;
+}
+
+int
+seafile_update_share_subdir_perm_for_user (const char *repo_id,
+                                           const char *path,
+                                           const char *owner,
+                                           const char *share_user,
+                                           const char *permission,
+                                           GError **error)
+{
+    if (is_empty_string (repo_id) || !is_uuid_valid (repo_id)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid repo_id parameter");
+        return -1;
+    }
+
+    if (is_empty_string (path) || strcmp (path, "/") == 0) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid path parameter");
+        return -1;
+    }
+
+    if (is_empty_string (owner)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid owner parameter");
+        return -1;
+    }
+
+    if (is_empty_string (share_user) ||
+        strcmp (owner, share_user) == 0) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid share_user parameter");
+        return -1;
+    }
+
+    if (!is_permission_valid (permission)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid permission parameter");
+        return -1;
+    }
+
+    char *real_path;
+    char *vrepo_id;
+    int ret = 0;
+
+    real_path = format_dir_path (path);
+    vrepo_id = seaf_repo_manager_get_virtual_repo_id (seaf->repo_mgr, repo_id,
+                                                      real_path, owner);
+    if (!vrepo_id) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
+                     "Failed to get shared sub repo");
+        ret = -1;
+        goto out;
+    }
+
+    ret = seaf_share_manager_set_permission (seaf->share_mgr, vrepo_id,
+                                             owner, share_user,
+                                             permission);
+    if (ret < 0) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
+                     "Failed to update share subdir permission for user");
+    }
+    g_free (vrepo_id);
+
+out:
+    g_free (real_path);
+    return ret;
 }
 
 GList *
@@ -2416,6 +2696,12 @@ seafile_group_share_repo (const char *repo_id, int group_id,
         return -1;
     }
 
+    if (!is_permission_valid (permission)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid permission parameter");
+        return -1;
+    }
+
     ret = seaf_repo_manager_add_group_repo (mgr, repo_id, group_id, user_name,
                                             permission, error);
 
@@ -2444,6 +2730,201 @@ seafile_group_unshare_repo (const char *repo_id, int group_id,
 
     return ret;
 
+}
+
+int
+seafile_share_subdir_to_group (const char *repo_id,
+                               const char *path,
+                               const char *owner,
+                               int share_group,
+                               const char *permission,
+                               const char *passwd,
+                               GError **error)
+{
+    if (is_empty_string (repo_id) || !is_uuid_valid (repo_id)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid repo_id parameter");
+        return -1;
+    }
+
+    if (is_empty_string (path) || strcmp (path, "/") == 0) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid path parameter");
+        return -1;
+    }
+
+    if (is_empty_string (owner)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid owner parameter");
+        return -1;
+    }
+
+    if (share_group < 0) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid share_group parameter");
+        return -1;
+    }
+
+    if (!is_permission_valid (permission)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid permission parameter");
+        return -1;
+    }
+
+    char *real_path;
+    char *vrepo_name;
+    char *vrepo_id;
+    int ret = 0;
+
+    real_path = format_dir_path (path);
+    // Use subdir name as virtual repo name and description
+    vrepo_name = g_path_get_basename (real_path);
+    vrepo_id = seaf_repo_manager_create_virtual_repo (seaf->repo_mgr,
+                                                      repo_id, real_path,
+                                                      vrepo_name, vrepo_name,
+                                                      owner, passwd, error);
+    if (!vrepo_id) {
+        ret = -1;
+        goto out;
+    }
+
+    ret = seaf_repo_manager_add_group_repo (seaf->repo_mgr, vrepo_id, share_group,
+                                            owner, permission, error);
+    if (ret < 0) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
+                     "Failed to share subdir to group");
+    }
+    g_free (vrepo_id);
+
+out:
+    g_free (vrepo_name);
+    g_free (real_path);
+    return ret;
+}
+
+int
+seafile_unshare_subdir_for_group (const char *repo_id,
+                                  const char *path,
+                                  const char *owner,
+                                  int share_group,
+                                  GError **error)
+{
+    if (is_empty_string (repo_id) || !is_uuid_valid (repo_id)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid repo_id parameter");
+        return -1;
+    }
+
+    if (is_empty_string (path) || strcmp (path, "/") == 0) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid path parameter");
+        return -1;
+    }
+
+    if (is_empty_string (owner)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid owner parameter");
+        return -1;
+    }
+
+    if (share_group < 0) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid share_group parameter");
+        return -1;
+    }
+
+    char *real_path;
+    char *vrepo_id;
+    int ret = 0;
+
+    real_path = format_dir_path (path);
+
+    vrepo_id = seaf_repo_manager_get_virtual_repo_id (seaf->repo_mgr, repo_id,
+                                                      real_path, owner);
+    if (!vrepo_id) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
+                     "Failed to get shared sub repo");
+        ret = -1;
+        goto out;
+    }
+
+    ret = seaf_repo_manager_del_group_repo (seaf->repo_mgr, vrepo_id,
+                                            share_group, error);
+    if (ret < 0) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
+                     "Failed to unshare subdir for group");
+    }
+    g_free (vrepo_id);
+
+out:
+    g_free (real_path);
+    return ret;
+}
+
+int
+seafile_update_share_subdir_perm_for_group (const char *repo_id,
+                                            const char *path,
+                                            const char *owner,
+                                            int share_group,
+                                            const char *permission,
+                                            GError **error)
+{
+    if (is_empty_string (repo_id) || !is_uuid_valid (repo_id)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid repo_id parameter");
+        return -1;
+    }
+
+    if (is_empty_string (path) || strcmp (path, "/") == 0) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid path parameter");
+        return -1;
+    }
+
+    if (is_empty_string (owner)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid owner parameter");
+        return -1;
+    }
+
+    if (share_group < 0) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid share_group parameter");
+        return -1;
+    }
+
+    if (!is_permission_valid (permission)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid permission parameter");
+        return -1;
+    }
+
+    char *real_path;
+    char *vrepo_id;
+    int ret = 0;
+
+    real_path = format_dir_path (path);
+    vrepo_id = seaf_repo_manager_get_virtual_repo_id (seaf->repo_mgr, repo_id,
+                                                      real_path, owner);
+    if (!vrepo_id) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
+                     "Failed to get shared sub repo");
+        ret = -1;
+        goto out;
+    }
+
+    ret = seaf_repo_manager_set_group_repo_perm (seaf->repo_mgr, vrepo_id,
+                                                 share_group, permission,
+                                                 error);
+    if (ret < 0) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
+                     "Failed to update share subdir permission for group");
+    }
+    g_free (vrepo_id);
+
+out:
+    g_free (real_path);
+    return ret;
 }
 
 char *
@@ -2668,9 +3149,15 @@ seafile_get_file_size (const char *store_id, int version,
 {
     gint64 file_size;
 
-    if (!store_id || !is_uuid_valid(store_id) || !file_id) {
+    if (!store_id || !is_uuid_valid(store_id)) {
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
-                     "Store id and file id can not be NULL");
+                     "Invalid store id");
+        return -1;
+    }
+
+    if (!file_id || !is_object_id_valid (file_id)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid file id");
         return -1;
     }
 
@@ -2690,9 +3177,15 @@ seafile_get_dir_size (const char *store_id, int version,
 {
     gint64 dir_size;
 
-    if (!store_id || !is_uuid_valid (store_id) || !dir_id) {
+    if (!store_id || !is_uuid_valid (store_id)) {
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
-                     "Store id and dir id can not be NULL");
+                     "Invalid store id");
+        return -1;
+    }
+
+    if (!dir_id || !is_object_id_valid (dir_id)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid dir id");
         return -1;
     }
 
@@ -2821,6 +3314,11 @@ seafile_revert_on_server (const char *repo_id,
         return -1;
     }
 
+    if (!is_object_id_valid (commit_id)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Invalid commit id");
+        return -1;
+    }
+
     return seaf_repo_manager_revert_on_server (seaf->repo_mgr,
                                                repo_id,
                                                commit_id,
@@ -2834,6 +3332,9 @@ seafile_post_file (const char *repo_id, const char *temp_file_path,
                    const char *user,
                    GError **error)
 {
+    char *norm_parent_dir = NULL, *norm_file_name = NULL, *rpath = NULL;
+    int ret = 0;
+
     if (!repo_id || !temp_file_path || !parent_dir || !file_name || !user) {
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
                      "Argument should not be null");
@@ -2845,19 +3346,37 @@ seafile_post_file (const char *repo_id, const char *temp_file_path,
         return -1;
     }
 
-    char *rpath = format_dir_path (parent_dir);
+    norm_parent_dir = normalize_utf8_path (parent_dir);
+    if (!norm_parent_dir) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Path is in valid UTF8 encoding");
+        ret = -1;
+        goto out;
+    }
+
+    norm_file_name = normalize_utf8_path (file_name);
+    if (!norm_file_name) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Path is in valid UTF8 encoding");
+        ret = -1;
+        goto out;
+    }
+
+    rpath = format_dir_path (norm_parent_dir);
 
     if (seaf_repo_manager_post_file (seaf->repo_mgr, repo_id,
                                      temp_file_path, rpath,
-                                     file_name, user,
+                                     norm_file_name, user,
                                      error) < 0) {
-        g_free (rpath);
-        return -1;
+        ret = -1;
     }
 
+out:
+    g_free (norm_parent_dir);
+    g_free (norm_file_name);
     g_free (rpath);
 
-    return 0;
+    return ret;
 }
 
 char *
@@ -2871,6 +3390,9 @@ seafile_post_file_blocks (const char *repo_id,
                           int replace_existed,
                           GError **error)
 {
+    char *norm_parent_dir = NULL, *norm_file_name = NULL, *rpath = NULL;
+    char *new_id = NULL;
+
     if (!repo_id || !parent_dir || !file_name
         || !blockids_json || ! paths_json || !user || file_size < 0) {
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
@@ -2883,20 +3405,38 @@ seafile_post_file_blocks (const char *repo_id,
         return NULL;
     }
 
-    char *new_id = NULL;
-    if (seaf_repo_manager_post_file_blocks (seaf->repo_mgr,
-                                            repo_id,
-                                            parent_dir,
-                                            file_name,
-                                            blockids_json,
-                                            paths_json,
-                                            user,
-                                            file_size,
-                                            replace_existed,
-                                            &new_id,
-                                            error) < 0) {
-        return NULL;
+    norm_parent_dir = normalize_utf8_path (parent_dir);
+    if (!norm_parent_dir) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Path is in valid UTF8 encoding");
+        goto out;
     }
+
+    norm_file_name = normalize_utf8_path (file_name);
+    if (!norm_file_name) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Path is in valid UTF8 encoding");
+        goto out;
+    }
+
+    rpath = format_dir_path (norm_parent_dir);
+
+    seaf_repo_manager_post_file_blocks (seaf->repo_mgr,
+                                        repo_id,
+                                        rpath,
+                                        norm_file_name,
+                                        blockids_json,
+                                        paths_json,
+                                        user,
+                                        file_size,
+                                        replace_existed,
+                                        &new_id,
+                                        error);
+
+out:
+    g_free (norm_parent_dir);
+    g_free (norm_file_name);
+    g_free (rpath);
 
     return new_id;
 }
@@ -2910,6 +3450,9 @@ seafile_post_multi_files (const char *repo_id,
                           int replace_existed,
                           GError **error)
 {
+    char *norm_parent_dir = NULL, *rpath = NULL;
+    char *ret_json = NULL;
+
     if (!repo_id || !filenames_json || !parent_dir || !paths_json || !user) {
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
                      "Argument should not be null");
@@ -2921,18 +3464,28 @@ seafile_post_multi_files (const char *repo_id,
         return NULL;
     }
 
-    char *ret_json = NULL;
-    if (seaf_repo_manager_post_multi_files (seaf->repo_mgr,
-                                            repo_id,
-                                            parent_dir,
-                                            filenames_json,
-                                            paths_json,
-                                            user,
-                                            replace_existed,
-                                            &ret_json,
-                                            error) < 0) {
-        return NULL;
+    norm_parent_dir = normalize_utf8_path (parent_dir);
+    if (!norm_parent_dir) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Path is in valid UTF8 encoding");
+        goto out;
     }
+
+    rpath = format_dir_path (norm_parent_dir);
+
+    seaf_repo_manager_post_multi_files (seaf->repo_mgr,
+                                        repo_id,
+                                        rpath,
+                                        filenames_json,
+                                        paths_json,
+                                        user,
+                                        replace_existed,
+                                        &ret_json,
+                                        error);
+
+out:
+    g_free (norm_parent_dir);
+    g_free (rpath);
 
     return ret_json;
 }
@@ -2943,6 +3496,9 @@ seafile_put_file (const char *repo_id, const char *temp_file_path,
                   const char *user, const char *head_id,
                   GError **error)
 {
+    char *norm_parent_dir = NULL, *norm_file_name = NULL, *rpath = NULL;
+    char *new_file_id = NULL;
+
     if (!repo_id || !temp_file_path || !parent_dir || !file_name || !user) {
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
                      "Argument should not be null");
@@ -2954,12 +3510,30 @@ seafile_put_file (const char *repo_id, const char *temp_file_path,
         return NULL;
     }
 
-    char *rpath = format_dir_path (parent_dir);
-    char *new_file_id = NULL;
+    norm_parent_dir = normalize_utf8_path (parent_dir);
+    if (!norm_parent_dir) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Path is in valid UTF8 encoding");
+        goto out;
+    }
+
+    norm_file_name = normalize_utf8_path (file_name);
+    if (!norm_file_name) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Path is in valid UTF8 encoding");
+        goto out;
+    }
+
+    rpath = format_dir_path (norm_parent_dir);
+
     seaf_repo_manager_put_file (seaf->repo_mgr, repo_id,
                                 temp_file_path, rpath,
-                                file_name, user, head_id,
+                                norm_file_name, user, head_id,
                                 &new_file_id, error);
+
+out:
+    g_free (norm_parent_dir);
+    g_free (norm_file_name);
     g_free (rpath);
 
     return new_file_id;
@@ -2971,6 +3545,9 @@ seafile_put_file_blocks (const char *repo_id, const char *parent_dir,
                          const char *paths_json, const char *user,
                          const char *head_id, gint64 file_size, GError **error)
 {
+    char *norm_parent_dir = NULL, *norm_file_name = NULL, *rpath = NULL;
+    char *new_file_id = NULL;
+
     if (!repo_id || !parent_dir || !file_name
         || !blockids_json || ! paths_json || !user) {
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
@@ -2983,12 +3560,33 @@ seafile_put_file_blocks (const char *repo_id, const char *parent_dir,
         return NULL;
     }
 
-    char *new_file_id = NULL;
+    norm_parent_dir = normalize_utf8_path (parent_dir);
+    if (!norm_parent_dir) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Path is in valid UTF8 encoding");
+        goto out;
+    }
+
+    norm_file_name = normalize_utf8_path (file_name);
+    if (!norm_file_name) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Path is in valid UTF8 encoding");
+        goto out;
+    }
+
+    rpath = format_dir_path (norm_parent_dir);
+
     seaf_repo_manager_put_file_blocks (seaf->repo_mgr, repo_id,
-                                       parent_dir, file_name,
+                                       rpath, norm_file_name,
                                        blockids_json, paths_json,
                                        user, head_id, file_size,
                                        &new_file_id, error);
+
+out:
+    g_free (norm_parent_dir);
+    g_free (norm_file_name);
+    g_free (rpath);
+
     return new_file_id;
 }
 
@@ -2997,6 +3595,9 @@ seafile_post_dir (const char *repo_id, const char *parent_dir,
                   const char *new_dir_name, const char *user,
                   GError **error)
 {
+    char *norm_parent_dir = NULL, *norm_dir_name = NULL, *rpath = NULL;
+    int ret = 0;
+
     if (!repo_id || !parent_dir || !new_dir_name || !user) {
         g_set_error (error, 0, SEAF_ERR_BAD_ARGS, "Argument should not be null");
         return -1;
@@ -3007,18 +3608,36 @@ seafile_post_dir (const char *repo_id, const char *parent_dir,
         return -1;
     }
 
-    char *rpath = format_dir_path (parent_dir);
-
-    if (seaf_repo_manager_post_dir (seaf->repo_mgr, repo_id,
-                                    rpath, new_dir_name,
-                                    user, error) < 0) {
-        g_free (rpath);
-        return -1;
+    norm_parent_dir = normalize_utf8_path (parent_dir);
+    if (!norm_parent_dir) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Path is in valid UTF8 encoding");
+        ret = -1;
+        goto out;
     }
 
+    norm_dir_name = normalize_utf8_path (new_dir_name);
+    if (!norm_dir_name) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Path is in valid UTF8 encoding");
+        ret = -1;
+        goto out;
+    }
+
+    rpath = format_dir_path (norm_parent_dir);
+
+    if (seaf_repo_manager_post_dir (seaf->repo_mgr, repo_id,
+                                    rpath, norm_dir_name,
+                                    user, error) < 0) {
+        ret = -1;
+    }
+
+out:
+    g_free (norm_parent_dir);
+    g_free (norm_dir_name);
     g_free (rpath);
 
-    return 0;
+    return ret;
 }
 
 int
@@ -3026,6 +3645,9 @@ seafile_post_empty_file (const char *repo_id, const char *parent_dir,
                          const char *new_file_name, const char *user,
                          GError **error)
 {
+    char *norm_parent_dir = NULL, *norm_file_name = NULL, *rpath = NULL;
+    int ret = 0;
+
     if (!repo_id || !parent_dir || !new_file_name || !user) {
         g_set_error (error, 0, SEAF_ERR_BAD_ARGS, "Argument should not be null");
         return -1;
@@ -3036,18 +3658,36 @@ seafile_post_empty_file (const char *repo_id, const char *parent_dir,
         return -1;
     }
 
-    char *rpath = format_dir_path (parent_dir);
-
-    if (seaf_repo_manager_post_empty_file (seaf->repo_mgr, repo_id,
-                                           rpath, new_file_name,
-                                           user, error) < 0) {
-        g_free (rpath);
-        return -1;
+    norm_parent_dir = normalize_utf8_path (parent_dir);
+    if (!norm_parent_dir) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Path is in valid UTF8 encoding");
+        ret = -1;
+        goto out;
     }
 
+    norm_file_name = normalize_utf8_path (new_file_name);
+    if (!norm_file_name) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Path is in valid UTF8 encoding");
+        ret = -1;
+        goto out;
+    }
+
+    rpath = format_dir_path (norm_parent_dir);
+
+    if (seaf_repo_manager_post_empty_file (seaf->repo_mgr, repo_id,
+                                           rpath, norm_file_name,
+                                           user, error) < 0) {
+        ret = -1;
+    }
+
+out:
+    g_free (norm_parent_dir);
+    g_free (norm_file_name);
     g_free (rpath);
 
-    return 0;
+    return ret;
 }
 
 int
@@ -3055,6 +3695,9 @@ seafile_del_file (const char *repo_id, const char *parent_dir,
                   const char *file_name, const char *user,
                   GError **error)
 {
+    char *norm_parent_dir = NULL, *norm_file_name = NULL, *rpath = NULL;
+    int ret = 0;
+
     if (!repo_id || !parent_dir || !file_name || !user) {
         g_set_error (error, 0, SEAF_ERR_BAD_ARGS, "Argument should not be null");
         return -1;
@@ -3065,18 +3708,36 @@ seafile_del_file (const char *repo_id, const char *parent_dir,
         return -1;
     }
 
-    char *rpath = format_dir_path (parent_dir);
-
-    if (seaf_repo_manager_del_file (seaf->repo_mgr, repo_id,
-                                    rpath, file_name,
-                                    user, error) < 0) {
-        g_free (rpath);
-        return -1;
+    norm_parent_dir = normalize_utf8_path (parent_dir);
+    if (!norm_parent_dir) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Path is in valid UTF8 encoding");
+        ret = -1;
+        goto out;
     }
 
+    norm_file_name = normalize_utf8_path (file_name);
+    if (!norm_file_name) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Path is in valid UTF8 encoding");
+        ret = -1;
+        goto out;
+    }
+
+    rpath = format_dir_path (norm_parent_dir);
+
+    if (seaf_repo_manager_del_file (seaf->repo_mgr, repo_id,
+                                    rpath, norm_file_name,
+                                    user, error) < 0) {
+        ret = -1;
+    }
+
+out:
+    g_free (norm_parent_dir);
+    g_free (norm_file_name);
     g_free (rpath);
 
-    return 0;
+    return ret;
 }
 
 GObject *
@@ -3091,6 +3752,9 @@ seafile_copy_file (const char *src_repo_id,
                    int synchronous,
                    GError **error)
 {
+    char *norm_src_dir = NULL, *norm_src_filename = NULL;
+    char *norm_dst_dir = NULL, *norm_dst_filename = NULL;
+    char *rsrc_dir = NULL, *rdst_dir = NULL;
     GObject *ret = NULL;
 
     if (!src_repo_id || !src_dir || !src_filename ||
@@ -3104,14 +3768,48 @@ seafile_copy_file (const char *src_repo_id,
         return NULL;
     }
 
-    char *rsrc_dir = format_dir_path (src_dir);
-    char *rdst_dir = format_dir_path (dst_dir);
+    norm_src_dir = normalize_utf8_path (src_dir);
+    if (!norm_src_dir) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Path is in valid UTF8 encoding");
+        goto out;
+    }
+
+    norm_src_filename = normalize_utf8_path (src_filename);
+    if (!norm_src_filename) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Path is in valid UTF8 encoding");
+        goto out;
+    }
+
+    norm_dst_dir = normalize_utf8_path (dst_dir);
+    if (!norm_dst_dir) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Path is in valid UTF8 encoding");
+        goto out;
+    }
+
+    norm_dst_filename = normalize_utf8_path (dst_filename);
+    if (!norm_dst_filename) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Path is in valid UTF8 encoding");
+        goto out;
+    }
+
+    rsrc_dir = format_dir_path (norm_src_dir);
+    rdst_dir = format_dir_path (norm_dst_dir);
 
     ret = (GObject *)seaf_repo_manager_copy_file (seaf->repo_mgr,
-                                                  src_repo_id, rsrc_dir, src_filename,
-                                                  dst_repo_id, rdst_dir, dst_filename,
+                                                  src_repo_id, rsrc_dir, norm_src_filename,
+                                                  dst_repo_id, rdst_dir, norm_dst_filename,
                                                   user, need_progress, synchronous,
                                                   error);
+
+out:
+    g_free (norm_src_dir);
+    g_free (norm_src_filename);
+    g_free (norm_dst_dir);
+    g_free (norm_dst_filename);
     g_free (rsrc_dir);
     g_free (rdst_dir);
 
@@ -3125,11 +3823,15 @@ seafile_move_file (const char *src_repo_id,
                    const char *dst_repo_id,
                    const char *dst_dir,
                    const char *dst_filename,
+                   int replace,
                    const char *user,
                    int need_progress,
                    int synchronous,
                    GError **error)
 {
+    char *norm_src_dir = NULL, *norm_src_filename = NULL;
+    char *norm_dst_dir = NULL, *norm_dst_filename = NULL;
+    char *rsrc_dir = NULL, *rdst_dir = NULL;
     GObject *ret = NULL;
 
     if (!src_repo_id || !src_dir || !src_filename ||
@@ -3143,14 +3845,48 @@ seafile_move_file (const char *src_repo_id,
         return NULL;
     }
 
-    char *rsrc_dir = format_dir_path (src_dir);
-    char *rdst_dir = format_dir_path (dst_dir);
+    norm_src_dir = normalize_utf8_path (src_dir);
+    if (!norm_src_dir) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Path is in valid UTF8 encoding");
+        goto out;
+    }
+
+    norm_src_filename = normalize_utf8_path (src_filename);
+    if (!norm_src_filename) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Path is in valid UTF8 encoding");
+        goto out;
+    }
+
+    norm_dst_dir = normalize_utf8_path (dst_dir);
+    if (!norm_dst_dir) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Path is in valid UTF8 encoding");
+        goto out;
+    }
+
+    norm_dst_filename = normalize_utf8_path (dst_filename);
+    if (!norm_dst_filename) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Path is in valid UTF8 encoding");
+        goto out;
+    }
+
+    rsrc_dir = format_dir_path (norm_src_dir);
+    rdst_dir = format_dir_path (norm_dst_dir);
 
     ret = (GObject *)seaf_repo_manager_move_file (seaf->repo_mgr,
-                                                  src_repo_id, rsrc_dir, src_filename,
-                                                  dst_repo_id, rdst_dir, dst_filename,
-                                                  user, need_progress, synchronous,
+                                                  src_repo_id, rsrc_dir, norm_src_filename,
+                                                  dst_repo_id, rdst_dir, norm_dst_filename,
+                                                  replace, user, need_progress, synchronous,
                                                   error);
+
+out:
+    g_free (norm_src_dir);
+    g_free (norm_src_filename);
+    g_free (norm_dst_dir);
+    g_free (norm_dst_filename);
     g_free (rsrc_dir);
     g_free (rdst_dir);
 
@@ -3177,6 +3913,10 @@ seafile_rename_file (const char *repo_id,
                      const char *user,
                      GError **error)
 {
+    char *norm_parent_dir = NULL, *norm_oldname = NULL, *norm_newname = NULL;
+    char *rpath = NULL;
+    int ret = 0;
+
     if (!repo_id || !parent_dir || !oldname || !newname || !user) {
         g_set_error (error, 0, SEAF_ERR_BAD_ARGS, "Argument should not be null");
         return -1;
@@ -3187,13 +3927,44 @@ seafile_rename_file (const char *repo_id,
         return -1;
     }
 
-    if (seaf_repo_manager_rename_file (seaf->repo_mgr, repo_id,
-                                       parent_dir, oldname, newname,
-                                       user, error) < 0) {
-        return -1;
+    norm_parent_dir = normalize_utf8_path (parent_dir);
+    if (!norm_parent_dir) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Path is in valid UTF8 encoding");
+        ret = -1;
+        goto out;
     }
 
-    return 0;
+    norm_oldname = normalize_utf8_path (oldname);
+    if (!norm_oldname) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Path is in valid UTF8 encoding");
+        ret = -1;
+        goto out;
+    }
+
+    norm_newname = normalize_utf8_path (newname);
+    if (!norm_newname) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Path is in valid UTF8 encoding");
+        ret = -1;
+        goto out;
+    }
+
+    rpath = format_dir_path (norm_parent_dir);
+
+    if (seaf_repo_manager_rename_file (seaf->repo_mgr, repo_id,
+                                       rpath, norm_oldname, norm_newname,
+                                       user, error) < 0) {
+        ret = -1;
+    }
+
+out:
+    g_free (norm_parent_dir);
+    g_free (norm_oldname);
+    g_free (norm_newname);
+    g_free (rpath);
+    return ret;
 }
 
 int
@@ -3424,7 +4195,7 @@ seafile_get_dirent_by_path (const char *repo_id, const char *path,
     }
 
     SeafDirent *dirent = seaf_fs_manager_get_dirent_by_path (seaf->fs_mgr,
-                                                             repo_id, repo->version,
+                                                             repo->store_id, repo->version,
                                                              commit->root_id, rpath,
                                                              error);
     g_free (rpath);
@@ -3454,15 +4225,22 @@ seafile_get_dirent_by_path (const char *repo_id, const char *path,
 }
 
 char *
-seafile_list_file (const char *repo_id,
-                   const char *file_id, int offset, int limit, GError **error)
+seafile_list_file_blocks (const char *repo_id,
+                          const char *file_id,
+                          int offset, int limit,
+                          GError **error)
 {
     SeafRepo *repo;
     Seafile *file;
     GString *buf = g_string_new ("");
     int index = 0;
 
-    if (!repo_id || !is_uuid_valid(repo_id) || file_id == NULL) {
+    if (!repo_id || !is_uuid_valid(repo_id)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_DIR_ID, "Bad repo id");
+        return NULL;
+    }
+
+    if (!file_id || !is_object_id_valid(file_id)) {
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_DIR_ID, "Bad file id");
         return NULL;
     }
@@ -3530,7 +4308,12 @@ seafile_list_dir (const char *repo_id,
     GList *res = NULL;
     GList *p;
 
-    if (!repo_id || !is_uuid_valid(repo_id) || dir_id == NULL) {
+    if (!repo_id || !is_uuid_valid(repo_id)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_DIR_ID, "Bad repo id");
+        return NULL;
+    }
+
+    if (!dir_id || !is_object_id_valid (dir_id)) {
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_DIR_ID, "Bad dir id");
         return NULL;
     }
@@ -3567,6 +4350,10 @@ seafile_list_dir (const char *repo_id,
         }
 
         dent = p->data;
+
+        if (!is_object_id_valid (dent->id))
+            continue;
+
         d = g_object_new (SEAFILE_TYPE_DIRENT,
                           "obj_id", dent->id,
                           "obj_name", dent->name,
@@ -3661,6 +4448,11 @@ seafile_revert_file (const char *repo_id,
         return -1;
     }
 
+    if (!is_object_id_valid (commit_id)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Invalid commit id");
+        return -1;
+    }
+
     char *rpath = format_dir_path (path);
 
     int ret = seaf_repo_manager_revert_file (seaf->repo_mgr,
@@ -3689,6 +4481,11 @@ seafile_revert_dir (const char *repo_id,
         return -1;
     }
 
+    if (!is_object_id_valid (commit_id)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Invalid commit id");
+        return -1;
+    }
+
     char *rpath = format_dir_path (path);
 
     int ret = seaf_repo_manager_revert_dir (seaf->repo_mgr,
@@ -3699,9 +4496,61 @@ seafile_revert_dir (const char *repo_id,
     return ret;
 }
 
+
+char *
+seafile_check_repo_blocks_missing (const char *repo_id,
+                                   const char *blockids_json,
+                                   GError **error)
+{
+    json_t *array, *value, *ret_json;
+    json_error_t err;
+    size_t index;
+    char *json_data, *ret;
+    SeafRepo *repo = NULL;
+
+    array = json_loadb (blockids_json, strlen(blockids_json), 0, &err);
+    if (!array) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Bad arguments");
+        return NULL;
+    }
+
+    repo = seaf_repo_manager_get_repo (seaf->repo_mgr, repo_id);
+    if (!repo) {
+        seaf_warning ("Failed to get repo %.8s.\n", repo_id);
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Repo not found");
+        json_decref (array);
+        return NULL;
+    }
+
+    ret_json = json_array();
+    size_t n = json_array_size (array);
+    for (index = 0; index < n; index++) {
+        value = json_array_get (array, index);
+        const char *blockid = json_string_value (value);
+        if (!blockid)
+            continue;
+        if (!seaf_block_manager_block_exists(seaf->block_mgr, repo_id,
+                                             repo->version, blockid)) {
+            json_array_append_new (ret_json, json_string(blockid));
+        }
+    }
+
+    json_data = json_dumps (ret_json, 0);
+    ret = g_strdup (json_data);
+
+    free (json_data);
+    json_decref (ret_json);
+    json_decref (array);
+    return ret;
+}
+
+
 GList *
 seafile_get_deleted (const char *repo_id, int show_days,
-                     const char *path, GError **error)
+                     const char *path, const char *scan_stat,
+                     int limit, GError **error)
 {
     if (!repo_id) {
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
@@ -3720,7 +4569,8 @@ seafile_get_deleted (const char *repo_id, int show_days,
 
     GList *ret = seaf_repo_manager_get_deleted_entries (seaf->repo_mgr,
                                                         repo_id, show_days,
-                                                        rpath, error);
+                                                        rpath, scan_stat,
+                                                        limit, error);
     g_free (rpath);
 
     return ret;
@@ -3891,6 +4741,16 @@ seafile_list_dir_with_perm (const char *repo_id,
                             int limit,
                             GError **error)
 {
+    if (!repo_id || !is_uuid_valid (repo_id)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Invalid repo id");
+        return NULL;
+    }
+
+    if (!dir_id || !is_object_id_valid (dir_id)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Invalid dir id");
+        return NULL;
+    }
+
     char *rpath = format_dir_path (path);
 
     GList *ret = seaf_repo_manager_list_dir_with_perm (seaf->repo_mgr,
@@ -3918,6 +4778,18 @@ seafile_set_share_permission (const char *repo_id,
         return -1;
     }
 
+    if (!is_uuid_valid (repo_id)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid repo_id parameter");
+        return -1;
+    }
+
+    if (!is_permission_valid (permission)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid permission parameter");
+        return -1;
+    }
+
     return seaf_share_manager_set_permission (seaf->share_mgr,
                                               repo_id,
                                               from_email,
@@ -3939,6 +4811,13 @@ seafile_set_group_repo_permission (int group_id,
     if (!is_uuid_valid (repo_id)) {
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Invalid repo id");
         return -1;
+    }
+
+    if (!is_permission_valid (permission)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid permission parameter");
+        return -1;
+
     }
 
     return seaf_repo_manager_set_group_repo_perm (seaf->repo_mgr,

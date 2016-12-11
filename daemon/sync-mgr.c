@@ -20,6 +20,7 @@
 #include "status.h"
 #include "mq-mgr.h"
 #include "utils.h"
+#include "vc-utils.h"
 
 #include "sync-status-tree.h"
 
@@ -119,9 +120,6 @@ static void sync_task_free (SyncTask *task);
 
 static gboolean
 check_relay_status (SeafSyncManager *mgr, SeafRepo *repo);
-
-static gboolean
-has_old_commits_to_upload (SeafRepo *repo);
 
 static int
 sync_repo_v2 (SeafSyncManager *manager, SeafRepo *repo, gboolean is_manual_sync);
@@ -617,9 +615,11 @@ notify_sync (SeafRepo *repo)
         return;
 
     GString *buf = g_string_new (NULL);
-    g_string_append_printf (buf, "%s\t%s\t%s",
+    g_string_append_printf (buf, "%s\t%s\t%s\t%s\t%s",
                             repo->name,
                             repo->id,
+                            head->commit_id,
+                            head->parent_id,
                             head->desc);
     seaf_mq_manager_publish_notification (seaf->mq_mgr,
                                           "sync.done",
@@ -1596,6 +1596,9 @@ check_head_commit_http (SyncTask *task)
                                                  task);
     if (ret == 0)
         transition_sync_state (task, SYNC_STATE_INIT);
+    else if (ret < 0)
+        seaf_sync_manager_set_task_error (task, SYNC_ERROR_GET_SYNC_INFO);
+
     return ret;
 }
 
@@ -1706,10 +1709,11 @@ commit_repo (SyncTask *task)
 
     transition_sync_state (task, SYNC_STATE_COMMIT);
 
-    ccnet_job_manager_schedule_job (seaf->job_mgr, 
-                                    commit_job, 
-                                    commit_job_done,
-                                    task);
+    if (ccnet_job_manager_schedule_job (seaf->job_mgr, 
+                                        commit_job, 
+                                        commit_job_done,
+                                        task) < 0)
+        seaf_sync_manager_set_task_error (task, SYNC_ERROR_COMMIT);
 }
 
 static int
@@ -2112,11 +2116,12 @@ check_http_protocol_done (HttpProtocolVersion *result, void *user_data)
         state->checking = FALSE;
     } else if (strncmp(state->testing_host, "https", 5) != 0) {
         char *host_fileserver = http_fileserver_url(state->testing_host);
-        http_tx_manager_check_protocol_version (seaf->http_tx_mgr,
-                                                host_fileserver,
-                                                TRUE,
-                                                check_http_fileserver_protocol_done,
-                                                state);
+        if (http_tx_manager_check_protocol_version (seaf->http_tx_mgr,
+                                                    host_fileserver,
+                                                    TRUE,
+                                                    check_http_fileserver_protocol_done,
+                                                    state) < 0)
+            state->checking = FALSE;
         g_free (host_fileserver);
     } else {
         state->checking = FALSE;
@@ -2168,65 +2173,16 @@ check_http_protocol (SeafSyncManager *mgr, SeafRepo *repo)
 
     state->last_http_check_time = (gint64)time(NULL);
 
-    http_tx_manager_check_protocol_version (seaf->http_tx_mgr,
-                                            repo->server_url,
-                                            FALSE,
-                                            check_http_protocol_done,
-                                            state);
+    if (http_tx_manager_check_protocol_version (seaf->http_tx_mgr,
+                                                repo->server_url,
+                                                FALSE,
+                                                check_http_protocol_done,
+                                                state) < 0)
+        return FALSE;
+
     state->checking = TRUE;
 
     return FALSE;
-}
-
-/*
- * If the user upgarde from 3.0.x, there may be more than one commit to upload
- * on the local branch. The new syncing protocol can't handle more than one
- * commit. So if we detect this case, fall back to old protocol.
- * After the repo is synced this time, we can use new protocol in the future.
- */
-static gboolean
-has_old_commits_to_upload (SeafRepo *repo)
-{
-    SeafBranch *master = NULL, *local = NULL;
-    SeafCommit *head = NULL;
-    gboolean ret = TRUE;
-
-    master = seaf_branch_manager_get_branch (seaf->branch_mgr, repo->id, "master");
-    if (!master) {
-        seaf_warning ("No master branch found for repo %s(%.8s).\n",
-                      repo->name, repo->id);
-        goto out;
-    }
-    local = seaf_branch_manager_get_branch (seaf->branch_mgr, repo->id, "local");
-    if (!local) {
-        seaf_warning ("No local branch found for repo %s(%.8s).\n",
-                      repo->name, repo->id);
-        goto out;
-    }
-
-    if (strcmp (local->commit_id, master->commit_id) == 0) {
-        ret = FALSE;
-        goto out;
-    }
-
-    head = seaf_commit_manager_get_commit (seaf->commit_mgr,
-                                           repo->id, repo->version,
-                                           local->commit_id);
-    if (!head) {
-        seaf_warning ("Failed to get head commit of repo %s(%.8s).\n",
-                      repo->name, repo->id);
-        goto out;
-    }
-
-    if (head->second_parent_id == NULL &&
-        g_strcmp0 (head->parent_id, master->commit_id) == 0)
-        ret = FALSE;
-
-out:
-    seaf_branch_unref (master);
-    seaf_branch_unref (local);
-    seaf_commit_unref (head);
-    return ret;
 }
 
 gint
@@ -2261,6 +2217,7 @@ static gboolean
 handle_locked_file_update (SeafRepo *repo, struct index_state *istate,
                            LockedFileSet *fset, const char *path, LockedFile *locked)
 {
+    gboolean locked_on_server = FALSE;
     struct cache_entry *ce;
     char file_id[41];
     char *fullpath = NULL;
@@ -2270,8 +2227,11 @@ handle_locked_file_update (SeafRepo *repo, struct index_state *istate,
     SeafBranch *master = NULL;
     gboolean ret = TRUE;
 
+    locked_on_server = seaf_filelock_manager_is_file_locked (seaf->filelock_mgr,
+                                                             repo->id,
+                                                             path);
     /* File is still locked, do nothing. */
-    if (do_check_file_locked (path, repo->worktree))
+    if (do_check_file_locked (path, repo->worktree, locked_on_server))
         return FALSE;
 
     seaf_debug ("Update previously locked file %s in repo %.8s.\n",
@@ -2335,6 +2295,14 @@ handle_locked_file_update (SeafRepo *repo, struct index_state *istate,
                                           S_IFREG,
                                           SYNC_STATUS_SYNCED);
 
+    /* In checkout, the file was overwritten by rename, so the file attributes
+       are gone. We have to set read-only state again.
+    */
+    if (locked_on_server)
+        seaf_filelock_manager_lock_wt_file (seaf->filelock_mgr,
+                                            repo->id,
+                                            path);
+
 out:
     cleanup_file_blocks (repo->id, repo->version, file_id);
 
@@ -2352,13 +2320,18 @@ static gboolean
 handle_locked_file_delete (SeafRepo *repo, struct index_state *istate,
                            LockedFileSet *fset, const char *path, LockedFile *locked)
 {
+    gboolean locked_on_server = FALSE;
     char *fullpath = NULL;
     SeafStat st;
     gboolean file_exists = TRUE;
     gboolean ret = TRUE;
 
+    locked_on_server = seaf_filelock_manager_is_file_locked (seaf->filelock_mgr,
+                                                             repo->id,
+                                                             path);
+
     /* File is still locked, do nothing. */
-    if (do_check_file_locked (path, repo->worktree))
+    if (do_check_file_locked (path, repo->worktree, locked_on_server))
         return FALSE;
 
     seaf_debug ("Delete previously locked file %s in repo %.8s.\n",
@@ -2496,6 +2469,9 @@ check_folder_permissions_one_server (SeafSyncManager *mgr,
     HttpFolderPermReq *req;
     GList *requests = NULL;
 
+    if (!seaf_repo_manager_server_is_pro (seaf->repo_mgr, host))
+        return;
+
     gint64 now = (gint64)time(NULL);
 
     if (server_state->http_version == 0 ||
@@ -2542,12 +2518,15 @@ check_folder_permissions_one_server (SeafSyncManager *mgr,
     server_state->checking_folder_perms = TRUE;
 
     /* The requests list will be freed in http tx manager. */
-    http_tx_manager_get_folder_perms (seaf->http_tx_mgr,
-                                      server_state->effective_host,
-                                      server_state->use_fileserver_port,
-                                      requests,
-                                      check_folder_perms_done,
-                                      server_state);
+    if (http_tx_manager_get_folder_perms (seaf->http_tx_mgr,
+                                          server_state->effective_host,
+                                          server_state->use_fileserver_port,
+                                          requests,
+                                          check_folder_perms_done,
+                                          server_state) < 0) {
+        seaf_warning ("Failed to schedule check folder permissions\n");
+        server_state->checking_folder_perms = FALSE;
+    }
 }
 
 static void
@@ -2587,7 +2566,6 @@ check_server_locked_files_done (HttpLockedFiles *result, void *user_data)
     }
 
     SyncInfo *info;
-    GList *p;
     for (ptr = result->results; ptr; ptr = ptr->next) {
         locked_res = ptr->data;
 
@@ -2609,9 +2587,9 @@ check_server_locked_files_done (HttpLockedFiles *result, void *user_data)
 
 static void
 check_locked_files_one_server (SeafSyncManager *mgr,
-                                     const char *host,
-                                     HttpServerState *server_state,
-                                     GList *repos)
+                               const char *host,
+                               HttpServerState *server_state,
+                               GList *repos)
 {
     GList *ptr;
     SeafRepo *repo;
@@ -2619,6 +2597,9 @@ check_locked_files_one_server (SeafSyncManager *mgr,
     gint64 timestamp;
     HttpLockedFilesReq *req;
     GList *requests = NULL;
+
+    if (!seaf_repo_manager_server_is_pro (seaf->repo_mgr, host))
+        return;
 
     gint64 now = (gint64)time(NULL);
 
@@ -2666,12 +2647,15 @@ check_locked_files_one_server (SeafSyncManager *mgr,
     server_state->checking_locked_files = TRUE;
 
     /* The requests list will be freed in http tx manager. */
-    http_tx_manager_get_locked_files (seaf->http_tx_mgr,
-                                      server_state->effective_host,
-                                      server_state->use_fileserver_port,
-                                      requests,
-                                      check_server_locked_files_done,
-                                      server_state);
+    if (http_tx_manager_get_locked_files (seaf->http_tx_mgr,
+                                          server_state->effective_host,
+                                          server_state->use_fileserver_port,
+                                          requests,
+                                          check_server_locked_files_done,
+                                          server_state) < 0) {
+        seaf_warning ("Failed to schedule check server locked files\n");
+        server_state->checking_locked_files = FALSE;
+    }
 }
 
 static void
@@ -2704,13 +2688,19 @@ print_active_paths (SeafSyncManager *mgr)
 }
 #endif
 
+inline static gboolean
+periodic_sync_due (SeafRepo *repo)
+{
+    int now = (int)time(NULL);
+    return (now > (repo->last_sync_time + repo->sync_interval));
+}
+
 static int
 auto_sync_pulse (void *vmanager)
 {
     SeafSyncManager *manager = vmanager;
     GList *repos, *ptr;
     SeafRepo *repo;
-    gint64 now;
 
     repos = seaf_repo_manager_get_repo_list (manager->seaf->repo_mgr, -1, -1);
 
@@ -2777,16 +2767,20 @@ auto_sync_pulse (void *vmanager)
             if (repo->checking_locked_files)
                 continue;
 
-            now = (gint64)time(NULL);
+            gint64 now = (gint64)time(NULL);
             if (repo->last_check_locked_time == 0 ||
                 now - repo->last_check_locked_time >= CHECK_LOCKED_FILES_INTERVAL)
             {
                 repo->checking_locked_files = TRUE;
-                ccnet_job_manager_schedule_job (seaf->job_mgr,
-                                                check_locked_files,
-                                                check_locked_files_done,
-                                                repo);
-                repo->last_check_locked_time = now;
+                if (ccnet_job_manager_schedule_job (seaf->job_mgr,
+                                                    check_locked_files,
+                                                    check_locked_files_done,
+                                                    repo) < 0) {
+                    seaf_warning ("Failed to schedule check local locked files\n");
+                    repo->checking_locked_files = FALSE;
+                } else {
+                    repo->last_check_locked_time = now;
+                }
 
             }
         }
@@ -2800,7 +2794,10 @@ auto_sync_pulse (void *vmanager)
         if (repo->version > 0) {
             /* For repo version > 0, only use http sync. */
             if (check_http_protocol (manager, repo)) {
-                sync_repo_v2 (manager, repo, FALSE);
+                if (repo->sync_interval == 0)
+                    sync_repo_v2 (manager, repo, FALSE);
+                else if (periodic_sync_due (repo))
+                    sync_repo_v2 (manager, repo, TRUE);
             }
         } else {
             /* If relay is not ready or protocol version is not determined,
@@ -3041,7 +3038,8 @@ disable_auto_sync_for_repos (SeafSyncManager *mgr)
     repos = seaf_repo_manager_get_repo_list (seaf->repo_mgr, -1, -1);
     for (ptr = repos; ptr; ptr = ptr->next) {
         repo = ptr->data;
-        seaf_wt_monitor_unwatch_repo (seaf->wt_monitor, repo->id);
+        if (repo->sync_interval == 0)
+            seaf_wt_monitor_unwatch_repo (seaf->wt_monitor, repo->id);
         seaf_sync_manager_cancel_sync_task (mgr, repo->id);
         seaf_sync_manager_remove_active_path_info (mgr, repo->id);
     }
@@ -3074,7 +3072,8 @@ enable_auto_sync_for_repos (SeafSyncManager *mgr)
     repos = seaf_repo_manager_get_repo_list (seaf->repo_mgr, -1, -1);
     for (ptr = repos; ptr; ptr = ptr->next) {
         repo = ptr->data;
-        seaf_wt_monitor_watch_repo (seaf->wt_monitor, repo->id, repo->worktree);
+        if (repo->sync_interval == 0)
+            seaf_wt_monitor_watch_repo (seaf->wt_monitor, repo->id, repo->worktree);
     }
 
     g_list_free (repos);
@@ -3412,8 +3411,6 @@ seaf_sync_manager_active_paths_number (SeafSyncManager *mgr)
 void
 seaf_sync_manager_remove_active_path_info (SeafSyncManager *mgr, const char *repo_id)
 {
-    ActivePathsInfo *info;
-
     pthread_mutex_lock (&mgr->priv->paths_lock);
 
     g_hash_table_remove (mgr->priv->active_paths, repo_id);
@@ -3467,6 +3464,8 @@ refresh_windows_explorer_thread (void *vdata)
             count = 0;
         }
     }
+
+    return NULL;
 }
 
 void

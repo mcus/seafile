@@ -16,12 +16,14 @@ SCRIPT=$(readlink -f "$0")
 INSTALLPATH=$(dirname "${SCRIPT}")
 TOPDIR=$(dirname "${INSTALLPATH}")
 default_ccnet_conf_dir=${TOPDIR}/ccnet
+central_config_dir=${TOPDIR}/conf
 
 manage_py=${INSTALLPATH}/seahub/manage.py
 gunicorn_conf=${INSTALLPATH}/runtime/seahub.conf
 pidfile=${INSTALLPATH}/runtime/seahub.pid
 errorlog=${INSTALLPATH}/runtime/error.log
 accesslog=${INSTALLPATH}/runtime/access.log
+gunicorn_exe=${INSTALLPATH}/seahub/thirdpart/gunicorn
 
 
 script_name=$0
@@ -40,7 +42,7 @@ function usage () {
 
 # Check args
 if [[ $1 != "start" && $1 != "stop" && $1 != "restart" \
-    && $1 != "start-fastcgi" && $1 != "restart-fastcgi" ]]; then
+    && $1 != "start-fastcgi" && $1 != "restart-fastcgi" && $1 != "clearsessions" ]]; then
     usage;
     exit 1;
 fi
@@ -54,14 +56,10 @@ function check_python_executable() {
         PYTHON=python2.7
     elif which python27 2>/dev/null 1>&2; then
         PYTHON=python27
-    elif which python2.6 2>/dev/null 1>&2; then
-        PYTHON=python2.6
-    elif which python26 2>/dev/null 1>&2; then
-        PYTHON=python26
     else
         echo
-        echo "Can't find a python executable of version 2.6 or above in PATH"
-        echo "Install python 2.6+ before continue."
+        echo "Can't find a python executable of version 2.7 or above in PATH"
+        echo "Install python 2.7+ before continue."
         echo "Or if you installed it in a non-standard PATH, set the PYTHON enviroment varirable to it"
         echo
         exit 1
@@ -96,6 +94,9 @@ function validate_seahub_running () {
     if pgrep -f "${manage_py}" 2>/dev/null 1>&2; then
         echo "Seahub is already running."
         exit 1;
+    elif pgrep -f "seahub.wsgi:application" 2>/dev/null 1>&2; then
+        echo "Seahub is already running."
+        exit 1;
     fi
 }
 
@@ -116,6 +117,8 @@ if [[ ($1 == "start" || $1 == "restart" || $1 == "start-fastcgi" || $1 == "resta
         port=8000
     fi
 elif [[ $1 == "stop" && $# == 1 ]]; then
+    dummy=dummy
+elif [[ $1 == "clearsessions" && $# == 1 ]]; then
     dummy=dummy
 else
     usage;
@@ -143,38 +146,21 @@ function prepare_seahub_log_dir() {
 }
 
 function before_start() {
-    check_python_executable;
-    validate_ccnet_conf_dir;
-    read_seafile_data_dir;
-
+    prepare_env;
     warning_if_seafile_not_running;
     validate_seahub_running;
     prepare_seahub_log_dir;
-
-    if [[ -z "$LANG" ]]; then
-        echo "LANG is not set in ENV, set to en_US.UTF-8"
-        export LANG='en_US.UTF-8'
-    fi
-    if [[ -z "$LC_ALL" ]]; then
-        echo "LC_ALL is not set in ENV, set to en_US.UTF-8"
-        export LC_ALL='en_US.UTF-8'
-    fi
-
-    export CCNET_CONF_DIR=${default_ccnet_conf_dir}
-    export SEAFILE_CONF_DIR=${seafile_data_dir}
-    export PYTHONPATH=${INSTALLPATH}/seafile/lib/python2.6/site-packages:${INSTALLPATH}/seafile/lib64/python2.6/site-packages:${INSTALLPATH}/seahub/thirdpart:$PYTHONPATH
-    export PYTHONPATH=${INSTALLPATH}/seafile/lib/python2.7/site-packages:${INSTALLPATH}/seafile/lib64/python2.7/site-packages:$PYTHONPATH
 }
 
 function start_seahub () {
     before_start;
     echo "Starting seahub at port ${port} ..."
     check_init_admin;
-    $PYTHON "${manage_py}" run_gunicorn -c "${gunicorn_conf}" -b "0.0.0.0:${port}" --preload
+    $PYTHON $gunicorn_exe seahub.wsgi:application -c "${gunicorn_conf}" -b "0.0.0.0:${port}" --preload
 
     # Ensure seahub is started successfully
     sleep 5
-    if ! pgrep -f "${manage_py}" 2>/dev/null 1>&2; then
+    if ! pgrep -f "seahub.wsgi:application" 2>/dev/null 1>&2; then
         printf "\033[33mError:Seahub failed to start.\033[m\n"
         echo "Please try to run \"./seahub.sh start\" again"
         exit 1;
@@ -204,6 +190,39 @@ function start_seahub_fastcgi () {
     fi
     echo
     echo "Seahub is started"
+    echo
+}
+
+function prepare_env() {
+    check_python_executable;
+    validate_ccnet_conf_dir;
+    read_seafile_data_dir;
+
+    if [[ -z "$LANG" ]]; then
+        echo "LANG is not set in ENV, set to en_US.UTF-8"
+        export LANG='en_US.UTF-8'
+    fi
+    if [[ -z "$LC_ALL" ]]; then
+        echo "LC_ALL is not set in ENV, set to en_US.UTF-8"
+        export LC_ALL='en_US.UTF-8'
+    fi
+
+    export CCNET_CONF_DIR=${default_ccnet_conf_dir}
+    export SEAFILE_CONF_DIR=${seafile_data_dir}
+    export SEAFILE_CENTRAL_CONF_DIR=${central_config_dir}
+    export PYTHONPATH=${INSTALLPATH}/seafile/lib/python2.6/site-packages:${INSTALLPATH}/seafile/lib64/python2.6/site-packages:${INSTALLPATH}/seahub:${INSTALLPATH}/seahub/thirdpart:$PYTHONPATH
+    export PYTHONPATH=${INSTALLPATH}/seafile/lib/python2.7/site-packages:${INSTALLPATH}/seafile/lib64/python2.7/site-packages:$PYTHONPATH
+
+}
+
+function clear_sessions () {
+    prepare_env;
+
+    echo "Start clear expired session records ..."
+    $PYTHON "${manage_py}" clearsessions
+
+    echo
+    echo "Done"
     echo
 }
 
@@ -245,6 +264,9 @@ case $1 in
         stop_seahub
         sleep 2
         start_seahub_fastcgi
+        ;;
+    "clearsessions" )
+        clear_sessions
         ;;
 esac
 

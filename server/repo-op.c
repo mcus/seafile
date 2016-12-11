@@ -24,7 +24,6 @@
 #include "seafile-crypt.h"
 #include "diff-simple.h"
 #include "merge-new.h"
-#include "monitor-rpc-wrappers.h"
 
 #include "seaf-db.h"
 
@@ -629,7 +628,7 @@ seaf_repo_manager_post_file (SeafRepoManager *mgr,
         canon_path = get_canonical_path (parent_dir);
 
     if (should_ignore_file (file_name, NULL)) {
-        seaf_warning ("[post file] Invalid filename %s.\n", file_name);
+        seaf_debug ("[post file] Invalid filename %s.\n", file_name);
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
                      "Invalid filename");
         ret = -1;
@@ -637,7 +636,7 @@ seaf_repo_manager_post_file (SeafRepoManager *mgr,
     }
 
     if (strstr (parent_dir, "//") != NULL) {
-        seaf_warning ("[post file] parent_dir cantains // sequence.\n");
+        seaf_debug ("[post file] parent_dir cantains // sequence.\n");
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
                      "Invalid parent dir");
         ret = -1;
@@ -650,7 +649,7 @@ seaf_repo_manager_post_file (SeafRepoManager *mgr,
         if (seaf_passwd_manager_get_decrypt_key_raw (seaf->passwd_mgr,
                                                      repo_id, user,
                                                      key, iv) < 0) {
-            seaf_warning ("Passwd for repo %s is not set.\n", repo_id);
+            seaf_debug ("Passwd for repo %s is not set.\n", repo_id);
             g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
                          "Passwd is not set");
             ret = -1;
@@ -890,6 +889,8 @@ json_to_file_list (const char *files_json)
     json_error_t jerror;
     size_t index;
     json_t *value;
+    const char *file;
+    char *norm_file;
 
     array = json_loadb (files_json, strlen(files_json), 0, &jerror);
     if (!array) {
@@ -900,10 +901,21 @@ json_to_file_list (const char *files_json)
     size_t n = json_array_size (array);
     for (index = 0; index < n; index++) {
         value = json_array_get (array, index);
-        const char *file = json_string_value (value);
-        if (!file)
-            continue;
-        files = g_list_prepend (files, g_strdup (file));
+        file = json_string_value (value);
+        if (!file) {
+            g_list_free_full (files, g_free);
+            files = NULL;
+            break;
+        }
+
+        norm_file = normalize_utf8_path (file);
+        if (!norm_file) {
+            g_list_free_full (files, g_free);
+            files = NULL;
+            break;
+        }
+
+        files = g_list_prepend (files, norm_file);
     }
 
     json_decref (array);
@@ -980,7 +992,7 @@ seaf_repo_manager_post_multi_files (SeafRepoManager *mgr,
     filenames = json_to_file_list (filenames_json);
     paths = json_to_file_list (paths_json);
     if (!filenames || !paths) {
-        seaf_warning ("[post files] Invalid filenames or paths.\n");
+        seaf_debug ("[post files] Invalid filenames or paths.\n");
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Invalid files");
         ret = -1;
         goto out;
@@ -990,7 +1002,7 @@ seaf_repo_manager_post_multi_files (SeafRepoManager *mgr,
     for (ptr = filenames; ptr; ptr = ptr->next) {
         filename = ptr->data;
         if (should_ignore_file (filename, NULL)) {
-            seaf_warning ("[post files] Invalid filename %s.\n", filename);
+            seaf_debug ("[post files] Invalid filename %s.\n", filename);
             g_set_error (error, SEAFILE_DOMAIN, POST_FILE_ERR_FILENAME,
                          "%s", filename);
             ret = -1;
@@ -999,7 +1011,7 @@ seaf_repo_manager_post_multi_files (SeafRepoManager *mgr,
     }
 
     if (strstr (parent_dir, "//") != NULL) {
-        seaf_warning ("[post file] parent_dir cantains // sequence.\n");
+        seaf_debug ("[post file] parent_dir cantains // sequence.\n");
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
                      "Invalid parent dir");
         ret = -1;
@@ -1012,7 +1024,7 @@ seaf_repo_manager_post_multi_files (SeafRepoManager *mgr,
         if (seaf_passwd_manager_get_decrypt_key_raw (seaf->passwd_mgr,
                                                      repo_id, user,
                                                      key, iv) < 0) {
-            seaf_warning ("Passwd for repo %s is not set.\n", repo_id);
+            seaf_debug ("Passwd for repo %s is not set.\n", repo_id);
             g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
                          "Passwd is not set");
             ret = -1;
@@ -1124,7 +1136,7 @@ seaf_repo_manager_post_file_blocks (SeafRepoManager *mgr,
     blockids = json_to_file_list (blockids_json);
     paths = json_to_file_list (paths_json);
     if (g_list_length(blockids) != g_list_length(paths)) {
-        seaf_warning ("[post-blks] Invalid blockids or paths.\n");
+        seaf_debug ("[post-blks] Invalid blockids or paths.\n");
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Invalid files");
         ret = -1;
         goto out;
@@ -1149,7 +1161,7 @@ seaf_repo_manager_post_file_blocks (SeafRepoManager *mgr,
         canon_path = get_canonical_path (parent_dir);
 
     if (should_ignore_file (file_name, NULL)) {
-        seaf_warning ("[post-blks] Invalid filename %s.\n", file_name);
+        seaf_debug ("[post-blks] Invalid filename %s.\n", file_name);
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
                      "Invalid filename");
         ret = -1;
@@ -1157,7 +1169,7 @@ seaf_repo_manager_post_file_blocks (SeafRepoManager *mgr,
     }
 
     if (strstr (parent_dir, "//") != NULL) {
-        seaf_warning ("[post-blks] parent_dir cantains // sequence.\n");
+        seaf_debug ("[post-blks] parent_dir cantains // sequence.\n");
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
                      "Invalid parent dir");
         ret = -1;
@@ -1205,6 +1217,163 @@ out:
         seaf_commit_unref(head_commit);
     string_list_free (blockids);
     string_list_free (paths);
+    seaf_dirent_free (new_dent);
+    g_free (root_id);
+    g_free (canon_path);
+
+    if (ret == 0)
+        update_repo_size(repo_id);
+
+    return ret;
+}
+
+int
+seaf_repo_manager_post_blocks (SeafRepoManager *mgr,
+                               const char *repo_id,
+                               const char *blockids_json,
+                               const char *paths_json,
+                               const char *user,
+                               GError **error)
+{
+    SeafRepo *repo = NULL;
+    char buf[SEAF_PATH_MAX];
+    GList *blockids = NULL, *paths = NULL, *ptr;
+    int ret = 0;
+
+    blockids = json_to_file_list (blockids_json);
+    paths = json_to_file_list (paths_json);
+    if (g_list_length(blockids) != g_list_length(paths)) {
+        seaf_warning ("[post-blks] Invalid blockids or paths.\n");
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Invalid files");
+        ret = -1;
+        goto out;
+    }
+
+    for (ptr = paths; ptr; ptr = ptr->next) {
+        char *temp_file_path = ptr->data;
+        if (g_access (temp_file_path, R_OK) != 0) {
+            seaf_warning ("[post-blks] File block %s doesn't exist or not readable.\n",
+                          temp_file_path);
+            g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                         "Invalid input file");
+            ret = -1;
+            goto out;
+        }
+    }
+
+    GET_REPO_OR_FAIL(repo, repo_id);
+
+    /* Write blocks. */
+    if (seaf_fs_manager_index_raw_blocks (seaf->fs_mgr,
+                                          repo->store_id,
+                                          repo->version,
+                                          paths,
+                                          blockids) < 0) {
+        seaf_warning ("Failed to index file blocks.\n");
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
+                     "Failed to index blocks");
+        ret = -1;
+        goto out;
+    }
+
+out:
+    if (repo)
+        seaf_repo_unref (repo);
+    string_list_free (blockids);
+    string_list_free (paths);
+
+    if (ret == 0)
+        update_repo_size(repo_id);
+
+    return ret;
+}
+
+int
+seaf_repo_manager_commit_file_blocks (SeafRepoManager *mgr,
+                                      const char *repo_id,
+                                      const char *parent_dir,
+                                      const char *file_name,
+                                      const char *blockids_json,
+                                      const char *user,
+                                      gint64 file_size,
+                                      int replace_existed,
+                                      char **new_id,
+                                      GError **error)
+{
+    SeafRepo *repo = NULL;
+    SeafCommit *head_commit = NULL;
+    char *canon_path = NULL;
+    unsigned char sha1[20];
+    char buf[SEAF_PATH_MAX];
+    char *root_id = NULL;
+    SeafDirent *new_dent = NULL;
+    GList *blockids = NULL;
+    char hex[41];
+    int ret = 0;
+
+    blockids = json_to_file_list (blockids_json);
+
+    GET_REPO_OR_FAIL(repo, repo_id);
+    GET_COMMIT_OR_FAIL(head_commit, repo->id, repo->version, repo->head->commit_id);
+
+    if (!canon_path)
+        canon_path = get_canonical_path (parent_dir);
+
+    if (should_ignore_file (file_name, NULL)) {
+        seaf_warning ("[post-blks] Invalid filename %s.\n", file_name);
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid filename");
+        ret = -1;
+        goto out;
+    }
+
+    if (strstr (parent_dir, "//") != NULL) {
+        seaf_warning ("[post-blks] parent_dir cantains // sequence.\n");
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Invalid parent dir");
+        ret = -1;
+        goto out;
+    }
+
+    /* Write blocks. */
+    if (seaf_fs_manager_index_existed_file_blocks (
+            seaf->fs_mgr, repo->store_id, repo->version,
+            blockids, sha1, file_size) < 0) {
+        seaf_warning ("Failed to index existed file  blocks.\n");
+        g_set_error (error, SEAFILE_DOMAIN, POST_FILE_ERR_BLOCK_MISSING,
+                     "Failed to index file blocks");
+        ret = -1;
+        goto out;
+    }
+
+    rawdata_to_hex(sha1, hex, 20);
+    new_dent = seaf_dirent_new (dir_version_from_repo_version(repo->version),
+                                hex, STD_FILE_MODE, file_name,
+                                (gint64)time(NULL), user, file_size);
+
+    root_id = do_post_file_replace (repo, head_commit->root_id,
+                                    canon_path, replace_existed, new_dent);
+    if (!root_id) {
+        seaf_warning ("[post-blks] Failed to post file to %s in repo %s.\n",
+                      canon_path, repo->id);
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
+                     "Failed to put file");
+        ret = -1;
+        goto out;
+    }
+
+    *new_id = g_strdup(hex);
+    snprintf(buf, SEAF_PATH_MAX, "Added \"%s\"", file_name);
+    if (gen_new_commit (repo_id, head_commit, root_id,
+                        user, buf, NULL, error) < 0)
+        ret = -1;
+
+out:
+    if (repo)
+        seaf_repo_unref (repo);
+    if (head_commit)
+        seaf_commit_unref(head_commit);
+    string_list_free (blockids);
     seaf_dirent_free (new_dent);
     g_free (root_id);
     g_free (canon_path);
@@ -1449,6 +1618,7 @@ static int
 put_dirent_and_commit (SeafRepo *repo,
                        const char *path,
                        SeafDirent *dent,
+                       int replace,
                        const char *user,
                        GError **error)
 {
@@ -1459,8 +1629,9 @@ put_dirent_and_commit (SeafRepo *repo,
 
     GET_COMMIT_OR_FAIL(head_commit, repo->id, repo->version, repo->head->commit_id);
 
-    root_id = do_post_file (repo,
-                            head_commit->root_id, path, dent);
+    root_id = do_post_file_replace (repo,
+                                    head_commit->root_id, path,
+                                    replace, dent);
     if (!root_id) {
         seaf_warning ("[cp file] Failed to cp file %s to %s in repo %s.\n",
                       dent->name, path, repo->id);
@@ -1585,7 +1756,7 @@ copy_recursive (SeafRepo *src_repo, SeafRepo *dst_repo,
 
             new_dent = seaf_dirent_new (dir_version_from_repo_version(dst_repo->version),
                                         new_id, dent->mode, dent->name,
-                                        (gint64)time(NULL), modifier, new_size);
+                                        dent->mtime, modifier, new_size);
             dst_ents = g_list_prepend (dst_ents, new_dent);
             g_free (new_id);
         }
@@ -1619,6 +1790,7 @@ cross_repo_copy (const char *src_repo_id,
                  const char *dst_repo_id,
                  const char *dst_path,
                  const char *dst_filename,
+                 int replace,
                  const char *modifier,
                  CopyTask *task)
 {
@@ -1656,12 +1828,13 @@ cross_repo_copy (const char *src_repo_id,
 
     dst_dent = seaf_dirent_new (dir_version_from_repo_version(dst_repo->version),
                                 new_id, src_dent->mode, dst_filename,
-                                (gint64)time(NULL), modifier, new_size);
+                                src_dent->mtime, modifier, new_size);
     g_free (new_id);
 
     if (put_dirent_and_commit (dst_repo,
                                dst_path,
                                dst_dent,
+                               replace,
                                modifier,
                                NULL) < 0) {
         ret = -1;
@@ -1823,11 +1996,12 @@ seaf_repo_manager_copy_file (SeafRepoManager *mgr,
         /* duplicate src dirent with new name */
         dst_dent = seaf_dirent_new (dir_version_from_repo_version(dst_repo->version),
                                     src_dent->id, src_dent->mode, dst_filename,
-                                    (gint64)time(NULL), user, file_size);
+                                    src_dent->mtime, user, file_size);
 
         if (put_dirent_and_commit (dst_repo,
                                    dst_canon_path,
                                    dst_dent,
+                                   0,
                                    user,
                                    error) < 0) {
             if (!error)
@@ -1869,6 +2043,7 @@ seaf_repo_manager_copy_file (SeafRepoManager *mgr,
                                               dst_repo_id,
                                               dst_canon_path,
                                               dst_filename,
+                                              0,
                                               user,
                                               total_files,
                                               cross_repo_copy,
@@ -1888,6 +2063,7 @@ seaf_repo_manager_copy_file (SeafRepoManager *mgr,
                              dst_repo_id,
                              dst_canon_path,
                              dst_filename,
+                             0,
                              user,
                              NULL) < 0) {
             g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
@@ -1926,6 +2102,7 @@ static int
 move_file_same_repo (const char *repo_id,
                      const char *src_path, SeafDirent *src_dent,
                      const char *dst_path, SeafDirent *dst_dent,
+                     int replace,
                      const char *user,
                      GError **error)
 {
@@ -1938,8 +2115,9 @@ move_file_same_repo (const char *repo_id,
     GET_REPO_OR_FAIL(repo, repo_id);
     GET_COMMIT_OR_FAIL(head_commit, repo->id, repo->version, repo->head->commit_id);
     
-    root_id_after_put = do_post_file (repo,
-                                      head_commit->root_id, dst_path, dst_dent);
+    root_id_after_put = do_post_file_replace (repo,
+                                              head_commit->root_id, dst_path,
+                                              replace, dst_dent);
     if (!root_id_after_put) {
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "move file failed");
         ret = -1;
@@ -1982,6 +2160,7 @@ cross_repo_move (const char *src_repo_id,
                  const char *dst_repo_id,
                  const char *dst_path,
                  const char *dst_filename,
+                 int replace,
                  const char *modifier,
                  CopyTask *task)
 {
@@ -2019,12 +2198,13 @@ cross_repo_move (const char *src_repo_id,
 
     dst_dent = seaf_dirent_new (dir_version_from_repo_version(dst_repo->version),
                                 new_id, src_dent->mode, dst_filename,
-                                (gint64)time(NULL), modifier, new_size);
+                                src_dent->mtime, modifier, new_size);
     g_free (new_id);
 
     if (put_dirent_and_commit (dst_repo,
                                dst_path,
                                dst_dent,
+                               replace,
                                modifier,
                                NULL) < 0) {
         ret = -1;
@@ -2072,6 +2252,7 @@ seaf_repo_manager_move_file (SeafRepoManager *mgr,
                              const char *dst_repo_id,
                              const char *dst_path,
                              const char *dst_filename,
+                             int replace,
                              const char *user,
                              int need_progress,
                              int synchronous,
@@ -2109,8 +2290,8 @@ seaf_repo_manager_move_file (SeafRepoManager *mgr,
     GET_COMMIT_OR_FAIL(dst_head_commit,
                        dst_repo->id, dst_repo->version, 
                        dst_repo->head->commit_id);
-    FAIL_IF_FILE_EXISTS(dst_repo->store_id, dst_repo->version,
-                        dst_head_commit->root_id, dst_canon_path, dst_filename, NULL);
+    /*FAIL_IF_FILE_EXISTS(dst_repo->store_id, dst_repo->version,
+                        dst_head_commit->root_id, dst_canon_path, dst_filename, NULL);*/
 
     /* get src dirent */
     src_dent = get_dirent_by_path (src_repo, NULL,
@@ -2126,13 +2307,13 @@ seaf_repo_manager_move_file (SeafRepoManager *mgr,
         /* duplicate src dirent with new name */
         dst_dent = seaf_dirent_new (dir_version_from_repo_version (dst_repo->version),
                                     src_dent->id, src_dent->mode, dst_filename,
-                                    (gint64)time(NULL), user, file_size);
+                                    src_dent->mtime, user, file_size);
 
         /* move file within the same repo */
         if (move_file_same_repo (src_repo_id,
                                  src_canon_path, src_dent,
                                  dst_canon_path, dst_dent,
-                                 user, error) < 0) {
+                                 replace, user, error) < 0) {
             ret = -1;
             goto out;
         }
@@ -2148,12 +2329,13 @@ seaf_repo_manager_move_file (SeafRepoManager *mgr,
             /* duplicate src dirent with new name */
             dst_dent = seaf_dirent_new (dir_version_from_repo_version(dst_repo->version),
                                         src_dent->id, src_dent->mode, dst_filename,
-                                        (gint64)time(NULL), user, file_size);
+                                        src_dent->mtime, user, file_size);
 
             /* add this dirent to dst repo */
             if (put_dirent_and_commit (dst_repo,
                                        dst_canon_path,
                                        dst_dent,
+                                       replace,
                                        user,
                                        error) < 0) {
                 if (!error)
@@ -2203,6 +2385,7 @@ seaf_repo_manager_move_file (SeafRepoManager *mgr,
                                                   dst_repo_id,
                                                   dst_canon_path,
                                                   dst_filename,
+                                                  replace,
                                                   user,
                                                   total_files,
                                                   cross_repo_move,
@@ -2222,6 +2405,7 @@ seaf_repo_manager_move_file (SeafRepoManager *mgr,
                                  dst_repo_id,
                                  dst_canon_path,
                                  dst_filename,
+                                 replace,
                                  user,
                                  NULL) < 0) {
                 g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
@@ -4147,6 +4331,7 @@ convert_to_seafile_commit (SeafCommit *c)
                   "version", c->version,
                   "new_merge", c->new_merge,
                   "conflict", c->conflict,
+                  "device_name", c->device_name,
                   NULL);
     return commit;
 }
@@ -4203,7 +4388,8 @@ seaf_repo_manager_list_file_revisions (SeafRepoManager *mgr,
     gboolean is_renamed = FALSE;
     char *parent_id = NULL, *old_path = NULL;
     GList *old_revisions = NULL;
-    int show_time;
+    gint64 truncate_time;
+    gint64 show_time;
 
     repo = seaf_repo_manager_get_repo (mgr, repo_id);
     if (!repo) {
@@ -4223,9 +4409,15 @@ seaf_repo_manager_list_file_revisions (SeafRepoManager *mgr,
     data.error = error;
     data.max_revision = max_revision;
 
-    show_time = show_days > 0 ? time(NULL) - show_days*24*3600 : -1;
-    data.truncate_time = MAX (show_time,
-                              seaf_repo_manager_get_repo_truncate_time (mgr, repo_id));
+    truncate_time = seaf_repo_manager_get_repo_truncate_time (mgr, repo_id);
+    if (truncate_time == 0) {
+        // Don't keep history
+        data.truncate_time = 0;
+    } else {
+        show_time = show_days > 0 ? time(NULL) - show_days*24*3600 : -1;
+        data.truncate_time = MAX (truncate_time, show_time);
+    }
+
     data.wanted_commits = NULL;
     data.file_id_list = NULL;
     data.file_size_list = NULL;
@@ -4691,7 +4883,7 @@ find_deleted_recursive (SeafRepo *repo,
             if ((dent1->mode & S_IFMT) != (dent2->mode & S_IFMT)) {
                 /* both exists but with diffent type. */
                 add_deleted_entry (repo, entries, dent2, base, child, parent);
-            } else if (S_ISDIR(dent1->mode)) {
+            } else if (S_ISDIR(dent1->mode) && strcmp(dent1->id, dent2->id) != 0) {
                 SeafDir *n1 = seaf_fs_manager_get_seafdir_sorted (seaf->fs_mgr,
                                                                   repo->id,
                                                                   repo->version,
@@ -4750,9 +4942,7 @@ find_deleted (SeafRepo *repo,
                                                      repo->version,
                                                      child->root_id, base);
     if (!d1) {
-        seaf_warning ("Failed to find dir %s on root %s of repo %s.\n",
-                      base, child->root_id, repo->id);
-        return -1;
+        return ret;
     }
 
     d2 = seaf_fs_manager_get_seafdir_sorted_by_path (seaf->fs_mgr,
@@ -4760,13 +4950,14 @@ find_deleted (SeafRepo *repo,
                                                      repo->version,
                                                      parent->root_id, base);
     if (!d2) {
-        seaf_warning ("Failed to find dir %s on root %s of repo %s.\n",
-                      base, parent->root_id, repo->id);
         seaf_dir_free (d1);
-        return -1;
+        return ret;
     }
 
     ret = find_deleted_recursive (repo, d1, d2, base, child, parent, entries);
+
+    seaf_dir_free (d2);
+    seaf_dir_free (d1);
 
     return ret;
 }
@@ -4915,20 +5106,177 @@ hash_to_list (gpointer key, gpointer value, gpointer user_data)
     return TRUE;
 }
 
+static gint
+compare_commit_by_time (gconstpointer a, gconstpointer b, gpointer unused)
+{
+    const SeafCommit *commit_a = a;
+    const SeafCommit *commit_b = b;
+
+    /* Latest commit comes first in the list. */
+    return (commit_b->ctime - commit_a->ctime);
+}
+
+static int
+insert_parent_commit (GList **list, GHashTable *hash,
+                      const char *repo_id, int version,
+                      const char *parent_id)
+{
+    SeafCommit *p;
+    char *key;
+
+    if (g_hash_table_lookup (hash, parent_id) != NULL)
+        return 0;
+
+    p = seaf_commit_manager_get_commit (seaf->commit_mgr,
+                                        repo_id, version,
+                                        parent_id);
+    if (!p) {
+        seaf_warning ("Failed to find commit %s\n", parent_id);
+        return -1;
+    }
+
+    *list = g_list_insert_sorted_with_data (*list, p,
+                                           compare_commit_by_time,
+                                           NULL);
+
+    key = g_strdup (parent_id);
+    g_hash_table_replace (hash, key, key);
+
+    return 0;
+}
+
+static int
+scan_commits_for_collect_deleted (CollectDelData *data,
+                                  const char *prev_scan_stat,
+                                  int limit,
+                                  char **next_scan_stat)
+{
+    GList *list = NULL;
+    SeafCommit *commit;
+    GHashTable *commit_hash;
+    SeafRepo *repo = data->repo;
+    int scan_num = 0;
+    gboolean ret = TRUE;
+
+    /* A hash table for recording id of traversed commits. */
+    commit_hash = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+
+    char *key;
+    if (prev_scan_stat == NULL) {
+        commit = seaf_commit_manager_get_commit (seaf->commit_mgr, repo->id,
+                                                 repo->version, repo->head->commit_id);
+        if (!commit) {
+            ret = FALSE;
+            goto out;
+        }
+        list = g_list_prepend (list, commit);
+        key = g_strdup (commit->commit_id);
+        g_hash_table_replace (commit_hash, key, key);
+    } else {
+        commit = seaf_commit_manager_get_commit (seaf->commit_mgr, repo->id,
+                                                 repo->version, prev_scan_stat);
+        if (!commit) {
+            ret = FALSE;
+            goto out;
+        }
+        list = g_list_append (list, commit);
+        key = g_strdup (commit->commit_id);
+        g_hash_table_replace (commit_hash, key, key);
+    }
+
+    while (list) {
+        gboolean stop = FALSE;
+        commit = list->data;
+        list = g_list_delete_link (list, list);
+
+        if (!collect_deleted (commit, data, &stop)) {
+            seaf_warning("[comit-mgr] CommitTraverseFunc failed\n");
+            seaf_commit_unref (commit);
+            ret = FALSE;
+            goto out;
+        }
+
+        if (stop) {
+            seaf_commit_unref (commit);
+            /* stop traverse down from this commit,
+             * but not stop traversing the tree
+             */
+            continue;
+        }
+
+        if (commit->parent_id) {
+            if (insert_parent_commit (&list, commit_hash, repo->id,
+                                      repo->version,
+                                      commit->parent_id) < 0) {
+                seaf_warning("[comit-mgr] insert parent commit failed\n");
+                seaf_commit_unref (commit);
+                ret = FALSE;
+                goto out;
+            }
+        }
+        if (commit->second_parent_id) {
+            if (insert_parent_commit (&list, commit_hash, repo->id,
+                                      repo->version,
+                                      commit->second_parent_id) < 0) {
+                seaf_warning("[comit-mgr]insert second parent commit failed\n");
+                seaf_commit_unref (commit);
+                ret = FALSE;
+                goto out;
+            }
+        }
+        seaf_commit_unref (commit);
+
+        if (++scan_num == limit && (!list || !list->next)) {
+            break;
+        }
+    }
+
+    // two scenarios:
+    // 1. list is empty, indicate scan end
+    // 2. list only have one commit, as start for next scan
+    if (list) {
+        commit = list->data;
+        *next_scan_stat = g_strdup (commit->commit_id);
+        seaf_commit_unref (commit);
+        list = g_list_delete_link (list, list);
+    }
+    g_hash_table_destroy (commit_hash);
+
+    return ret;
+
+out:
+    g_hash_table_destroy (commit_hash);
+    while (list) {
+        commit = list->data;
+        seaf_commit_unref (commit);
+        list = g_list_delete_link (list, list);
+    }
+
+    return ret;
+}
+
 GList *
 seaf_repo_manager_get_deleted_entries (SeafRepoManager *mgr,
                                        const char *repo_id,
                                        int show_days,
                                        const char *path,
+                                       const char *scan_stat,
+                                       int limit,
                                        GError **error)
 {
     SeafRepo *repo;
     gint64 truncate_time, show_time;
     GList *ret = NULL;
+    char *next_scan_stat = NULL;
 
     truncate_time = seaf_repo_manager_get_repo_truncate_time (mgr, repo_id);
-    if (truncate_time == 0)
-        return NULL;
+    if (truncate_time == 0) {
+        // Don't keep history, set scan_stat as NULL, indicate no need for next scan
+        ret = g_list_append (ret, g_object_new (SEAFILE_TYPE_DELETED_ENTRY,
+                                                "scan_stat", NULL,
+                                                NULL));
+        return ret;
+    }
 
     if (show_days <= 0)
         show_time = -1;
@@ -4958,13 +5306,7 @@ seaf_repo_manager_get_deleted_entries (SeafRepoManager *mgr,
         data.path = g_strdup ("/");
     }
 
-    if (!seaf_commit_manager_traverse_commit_tree (seaf->commit_mgr,
-                                                   repo->id, repo->version,
-                                                   repo->head->commit_id,
-                                                   collect_deleted,
-                                                   &data,
-                                                   TRUE))
-    {
+    if (!scan_commits_for_collect_deleted (&data, scan_stat, limit, &next_scan_stat)) {
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_INTERNAL,
                      "Internal error");
         g_hash_table_destroy (entries);
@@ -4982,6 +5324,11 @@ seaf_repo_manager_get_deleted_entries (SeafRepoManager *mgr,
         g_hash_table_foreach_steal (entries, hash_to_list, &ret);
     }
 
+    // Append scan_stat entry to the end to indicate the end of scan result
+    ret = g_list_append (ret, g_object_new (SEAFILE_TYPE_DELETED_ENTRY,
+                                            "scan_stat", next_scan_stat,
+                                            NULL));
+
     g_hash_table_destroy (entries);
 
     seaf_repo_unref (repo);
@@ -4989,8 +5336,6 @@ seaf_repo_manager_get_deleted_entries (SeafRepoManager *mgr,
 
     return ret;
 }
-
-
 
 static SeafCommit *
 get_commit(SeafRepo *repo, const char *branch_or_commit)
@@ -5039,12 +5384,12 @@ seaf_repo_diff (SeafRepo *repo, const char *old, const char *new, int fold_dir_d
     if (old == NULL || old[0] == '\0') {
         if (c2->parent_id && c2->second_parent_id) {
             ret = diff_merge (c2, &diff_entries, fold_dir_diff);
+            seaf_commit_unref (c2);
             if (ret < 0) {
                 *error = g_strdup("Failed to do diff");
-                seaf_commit_unref (c2);
+                g_list_free_full (diff_entries, (GDestroyNotify)diff_entry_free);
                 return NULL;
             }
-            seaf_commit_unref (c2);
             return diff_entries;
         }
 
@@ -5067,8 +5412,11 @@ seaf_repo_diff (SeafRepo *repo, const char *old, const char *new, int fold_dir_d
 
     /* do diff */
     ret = diff_commits (c1, c2, &diff_entries, fold_dir_diff);
-    if (ret < 0)
+    if (ret < 0) {
+        g_list_free_full (diff_entries, (GDestroyNotify)diff_entry_free);
+        diff_entries = NULL;
         *error = g_strdup("Failed to do diff");
+    }
 
     seaf_commit_unref (c1);
     seaf_commit_unref (c2);

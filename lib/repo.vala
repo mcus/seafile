@@ -32,6 +32,7 @@ public class Repo : Object {
 
     public int    last_modify { get; set; }
     public int64  size { get; set; }
+    public int64  file_count { get; set; }
     public string head_cmmt_id { get; set; }
     public string root { get; set; }
 
@@ -156,6 +157,7 @@ public class DeletedEntry : Object {
     public int mode { get; set; }
     public int delete_time { get; set; }
     public int64 file_size { get; set; }
+    public string scan_stat { get; set; }
 }
 
 public class RepoTokenInfo: Object {
@@ -169,6 +171,7 @@ public class RepoTokenInfo: Object {
     public string peer_ip { get; set; }
     public string peer_name { get; set; }
     public int64 sync_time { get; set; }
+    public string client_ver { get; set; }
 }
 
 public class SharedUser : Object {

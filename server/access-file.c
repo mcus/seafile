@@ -26,10 +26,11 @@
 
 #include "seafile-session.h"
 #include "access-file.h"
-#include "pack-dir.h"
+#include "zip-download-mgr.h"
 
 #define FILE_TYPE_MAP_DEFAULT_LEN 1
 #define BUFFER_SIZE 1024 * 64
+#define MULTI_DOWNLOAD_FILE_PREFIX "documents-export-"
 
 struct file_type_map {
     char *suffix;
@@ -94,6 +95,7 @@ typedef struct SendDirData {
 
     int zipfd;
     char *zipfile;
+    char *token;
 
     bufferevent_data_cb saved_read_cb;
     bufferevent_data_cb saved_write_cb;
@@ -107,7 +109,6 @@ extern SeafileSession *seaf;
 
 static struct file_type_map ftmap[] = {
     { "txt", "text/plain" },
-    { "html", "text/html" },
     { "doc", "application/vnd.ms-word" },
     { "docx", "application/vnd.ms-word" },
     { "ppt", "application/vnd.ms-powerpoint" },
@@ -172,9 +173,10 @@ static void
 free_senddir_data (SendDirData *data)
 {
     close (data->zipfd);
-    g_unlink (data->zipfile);
 
-    g_free (data->zipfile);
+    zip_download_mgr_del_zip_progress (seaf->zip_download_mgr, data->token);
+
+    g_free (data->token);
     g_free (data);
 }
 
@@ -389,7 +391,7 @@ write_dir_data_cb (struct bufferevent *bev, void *ctx)
 
     n = readn (data->zipfd, buf, sizeof(buf));
     if (n < 0) {
-        seaf_warning ("failed to read zipfile %s\n", data->zipfile);
+        seaf_warning ("Failed to read zipfile %s: %s.\n", data->zipfile, strerror (errno));
         evhtp_connection_free (evhtp_request_get_connection (data->req));
         free_senddir_data (data);
     } else if (n > 0) {
@@ -593,6 +595,12 @@ do_file(evhtp_request_t *req, SeafRepo *repo, const char *file_id,
     evhtp_headers_add_header(req->headers_out,
                              evhtp_header_new("Content-Disposition", cont_filename,
                                               1, 1));
+
+    if (g_strcmp0 (type, "image/jpg") != 0) {
+        evhtp_headers_add_header(req->headers_out,
+                                 evhtp_header_new("X-Content-Type-Options", "nosniff",
+                                                  1, 1));
+    }
 
     /* If it's an empty file, send an empty reply. */
     if (file->n_blocks == 0) {
@@ -936,6 +944,12 @@ do_file_range (evhtp_request_t *req, SeafRepo *repo, const char *file_id,
 
     set_resp_disposition (req, operation, filename);
 
+    if (g_strcmp0 (type, "image/jpg") != 0) {
+        evhtp_headers_add_header(req->headers_out,
+                                 evhtp_header_new("X-Content-Type-Options", "nosniff",
+                                                  1, 1));
+    }
+
     data = g_new0 (SendFileRangeData, 1);
     if (!data) {
         seafile_unref (file);
@@ -977,70 +991,21 @@ do_file_range (evhtp_request_t *req, SeafRepo *repo, const char *file_id,
 }
 
 static int
-do_dir (evhtp_request_t *req, SeafRepo *repo, const char *dir_id,
-        const char *filename, const char *operation,
-        SeafileCryptKey *crypt_key)
+start_download_zip_file (evhtp_request_t *req, const char *token,
+                         const char *zipname, char *zipfile)
 {
-    char *zipfile = NULL;
-    char *filename_escaped = NULL;
-    char cont_filename[SEAF_PATH_MAX];
-    char file_size[255];
     SeafStat st;
-    char *key_hex, *iv_hex;
-    unsigned char enc_key[32], enc_iv[16];
-    SeafileCrypt *crypt = NULL;
+    char file_size[255];
+    char cont_filename[SEAF_PATH_MAX];
     int zipfd = 0;
-    int ret = 0;
-    gint64 dir_size = 0;
-
-    /* ensure file size does not exceed limit */
-    dir_size = seaf_fs_manager_get_fs_size (seaf->fs_mgr,
-                                            repo->store_id, repo->version,
-                                            dir_id);
-    if (dir_size < 0 || dir_size > seaf->http_server->max_download_dir_size) {
-        seaf_warning ("invalid dir size: %"G_GINT64_FORMAT"\n", dir_size);
-        ret = -1;
-        goto out;
-    }
-
-    /* Let's zip the directory first */
-    filename_escaped = g_uri_unescape_string (filename, NULL);
-    if (!filename_escaped) {
-        seaf_warning ("failed to unescape string %s\n", filename);
-        ret = -1;
-        goto out;
-    }
-
-    if (crypt_key != NULL) {
-        g_object_get (crypt_key,
-                      "key", &key_hex,
-                      "iv", &iv_hex,
-                      NULL);
-        if (repo->enc_version == 1)
-            hex_to_rawdata (key_hex, enc_key, 16);
-        else
-            hex_to_rawdata (key_hex, enc_key, 32);
-        hex_to_rawdata (iv_hex, enc_iv, 16);
-        crypt = seafile_crypt_new (repo->enc_version, enc_key, enc_iv);
-        g_free (key_hex);
-        g_free (iv_hex);
-    }
-
-    zipfile = pack_dir (repo->store_id, repo->version,
-                        filename_escaped, dir_id, crypt, test_windows(req));
-    if (!zipfile) {
-        ret = -1;
-        goto out;
-    }
-
-    /* OK, the dir is zipped */
-    evhtp_headers_add_header(req->headers_out,
-                evhtp_header_new("Content-Type", "application/zip", 1, 1));
 
     if (seaf_stat(zipfile, &st) < 0) {
-        ret = -1;
-        goto out;
+        seaf_warning ("Failed to stat %s: %s.\n", zipfile, strerror(errno));
+        return -1;
     }
+
+    evhtp_headers_add_header(req->headers_out,
+                             evhtp_header_new("Content-Type", "application/zip", 1, 1));
 
     snprintf (file_size, sizeof(file_size), "%"G_GUINT64_FORMAT"", st.st_size);
     evhtp_headers_add_header (req->headers_out,
@@ -1048,10 +1013,10 @@ do_dir (evhtp_request_t *req, SeafRepo *repo, const char *dir_id,
 
     if (test_firefox (req)) {
         snprintf(cont_filename, SEAF_PATH_MAX,
-                 "attachment;filename*=\"utf8\' \'%s.zip\"", filename);
+                 "attachment;filename*=\"utf8\' \'%s.zip\"", zipname);
     } else {
         snprintf(cont_filename, SEAF_PATH_MAX,
-                 "attachment;filename=\"%s.zip\"", filename);
+                 "attachment;filename=\"%s.zip\"", zipname);
     }
 
     evhtp_headers_add_header(req->headers_out,
@@ -1059,9 +1024,8 @@ do_dir (evhtp_request_t *req, SeafRepo *repo, const char *dir_id,
 
     zipfd = g_open (zipfile, O_RDONLY | O_BINARY, 0);
     if (zipfd < 0) {
-        seaf_warning ("failed to open zipfile %s\n", zipfile);
-        ret = -1;
-        goto out;
+        seaf_warning ("Failed to open zipfile %s: %s.\n", zipfile, strerror(errno));
+        return -1;
     }
 
     SendDirData *data;
@@ -1069,6 +1033,7 @@ do_dir (evhtp_request_t *req, SeafRepo *repo, const char *dir_id,
     data->req = req;
     data->zipfd = zipfd;
     data->zipfile = zipfile;
+    data->token = g_strdup (token);
     data->remain = st.st_size;
 
     /* We need to overwrite evhtp's callback functions to
@@ -1092,16 +1057,140 @@ do_dir (evhtp_request_t *req, SeafRepo *repo, const char *dir_id,
     /* Kick start data transfer by sending out http headers. */
     evhtp_send_reply_start(req, EVHTP_RES_OK);
 
-out:
-    g_free (filename_escaped);
-    if (ret < 0) {
-        if (zipfile != NULL) {
-            g_unlink (zipfile);
-            g_free (zipfile);
-        }
+    return 0;
+}
+
+static gboolean
+can_use_cached_content (evhtp_request_t *req)
+{
+    if (evhtp_kv_find (req->headers_in, "If-Modified-Since") != NULL) {
+        evhtp_send_reply (req, EVHTP_RES_NOTMOD);
+        return TRUE;
     }
 
-    return ret;
+    char http_date[256];
+    evhtp_kv_t *kv;
+    time_t now = time(NULL);
+
+    /* Set Last-Modified header if the client gets this file
+     * for the first time. So that the client will set
+     * If-Modified-Since header the next time it gets the same
+     * file.
+     */
+#ifndef WIN32
+    strftime (http_date, sizeof(http_date), "%a, %d %b %Y %T GMT",
+              gmtime(&now));
+#else
+    strftime (http_date, sizeof(http_date), "%a, %d %b %Y %H:%M:%S GMT",
+              gmtime(&now));
+#endif
+    kv = evhtp_kv_new ("Last-Modified", http_date, 1, 1);
+    evhtp_kvs_add_kv (req->headers_out, kv);
+
+    kv = evhtp_kv_new ("Cache-Control", "max-age=3600", 1, 1);
+    evhtp_kvs_add_kv (req->headers_out, kv);
+
+    return FALSE;
+}
+
+static void
+access_zip_cb (evhtp_request_t *req, void *arg)
+{
+    char *token;
+    SeafileWebAccess *info = NULL;
+    char *info_str = NULL;
+    json_t *info_obj = NULL;
+    json_error_t jerror;
+    char *filename = NULL;
+    char *zip_file_path;
+    const char *error = NULL;
+    int error_code;
+
+    char **parts = g_strsplit (req->uri->path->full + 1, "/", 0);
+    if (g_strv_length (parts) != 2) {
+        error = "Invalid URL\n";
+        error_code = EVHTP_RES_BADREQ;
+        goto out;
+    }
+
+    token = parts[1];
+    info = seaf_web_at_manager_query_access_token (seaf->web_at_mgr, token);
+    // Here only check token exist, follow will get zip file path, if zip file path exist
+    // then the token is valid, because it pass some validations in zip stage
+    if (!info) {
+        seaf_warning ("Token doesn't exist.\n");
+        error = "Invalid token\n";
+        error_code = EVHTP_RES_BADREQ;
+        goto out;
+    }
+
+    g_object_get (info, "obj_id", &info_str, NULL);
+    if (!info_str) {
+        seaf_warning ("Invalid token.\n");
+        error = "Invalid token\n";
+        error_code = EVHTP_RES_BADREQ;
+        goto out;
+    }
+
+    info_obj = json_loadb (info_str, strlen(info_str), 0, &jerror);
+    if (!info_obj) {
+        seaf_warning ("Failed to parse obj_id field: %s.\n", jerror.text);
+        error = "Invalid token\n";
+        error_code = EVHTP_RES_BADREQ;
+        goto out;
+    }
+
+    if (json_object_has_member (info_obj, "dir_name")) {
+        // Download dir
+        filename = g_strdup (json_object_get_string_member (info_obj, "dir_name"));
+    } else if (json_object_has_member (info_obj, "file_list")) {
+        // Download multi
+        time_t now = time(NULL);
+        char date_str[11];
+        strftime(date_str, sizeof(date_str), "%Y-%m-%d", localtime(&now));
+        filename = g_strconcat (MULTI_DOWNLOAD_FILE_PREFIX, date_str, NULL);
+    } else {
+        seaf_warning ("Invalid token.\n");
+        error = "Invalid token\n";
+        error_code = EVHTP_RES_BADREQ;
+        goto out;
+    }
+
+    zip_file_path = zip_download_mgr_get_zip_file_path (seaf->zip_download_mgr, token);
+    if (!zip_file_path) {
+        seaf_warning ("Failed to get zip file path.\n");
+        error = "Invalid token\n";
+        error_code = EVHTP_RES_BADREQ;
+        goto out;
+    }
+
+    if (can_use_cached_content (req)) {
+        // Clean zip progress related resource
+        zip_download_mgr_del_zip_progress (seaf->zip_download_mgr, token);
+        goto out;
+    }
+
+    int ret = start_download_zip_file (req, token, filename, zip_file_path);
+    if (ret < 0) {
+        error = "Internal server error\n";
+        error_code = EVHTP_RES_SERVERR;
+    }
+
+out:
+    g_strfreev (parts);
+    if (info)
+        g_object_unref (info);
+    if (info_str)
+        g_free (info_str);
+    if (info_obj)
+        json_decref (info_obj);
+    if (filename)
+        g_free (filename);
+
+    if (error) {
+        evbuffer_add_printf(req->buffer_out, "%s\n", error);
+        evhtp_send_reply(req, error_code);
+    }
 }
 
 static void
@@ -1112,7 +1201,7 @@ access_cb(evhtp_request_t *req, void *arg)
     char *token = NULL;
     char *filename = NULL;
     const char *repo_id = NULL;
-    const char *id = NULL;
+    const char *data = NULL;
     const char *operation = NULL;
     const char *user = NULL;
     const char *byte_ranges = NULL;
@@ -1139,42 +1228,18 @@ access_cb(evhtp_request_t *req, void *arg)
     }
 
     repo_id = seafile_web_access_get_repo_id (webaccess);
-    id = seafile_web_access_get_obj_id (webaccess);
+    data = seafile_web_access_get_obj_id (webaccess);
     operation = seafile_web_access_get_op (webaccess);
     user = seafile_web_access_get_username (webaccess);
 
     if (strcmp(operation, "view") != 0 &&
-        strcmp(operation, "download") != 0 &&
-        strcmp(operation, "download-dir") != 0) {
+        strcmp(operation, "download") != 0) {
         error = "Bad access token";
         goto bad_req;
     }
 
-    if (evhtp_kv_find (req->headers_in, "If-Modified-Since") != NULL) {
-        evhtp_send_reply (req, EVHTP_RES_NOTMOD);
+    if (can_use_cached_content (req)) {
         goto success;
-    } else {
-        char http_date[256];
-        evhtp_kv_t *kv;
-        time_t now = time(NULL);
-
-        /* Set Last-Modified header if the client gets this file
-         * for the first time. So that the client will set
-         * If-Modified-Since header the next time it gets the same
-         * file.
-         */
-#ifndef WIN32
-        strftime (http_date, sizeof(http_date), "%a, %d %b %Y %T GMT",
-                  gmtime(&now));
-#else
-        strftime (http_date, sizeof(http_date), "%a, %d %b %Y %H:%M:%S GMT",
-                  gmtime(&now));
-#endif
-        kv = evhtp_kv_new ("Last-Modified", http_date, 1, 1);
-        evhtp_kvs_add_kv (req->headers_out, kv);
-
-        kv = evhtp_kv_new ("Cache-Control", "max-age=3600", 1, 1);
-        evhtp_kvs_add_kv (req->headers_out, kv);
     }
 
     byte_ranges = evhtp_kv_find (req->headers_in, "Range");
@@ -1196,23 +1261,17 @@ access_cb(evhtp_request_t *req, void *arg)
     }
 
     if (!seaf_fs_manager_object_exists (seaf->fs_mgr,
-                                        repo->store_id, repo->version, id)) {
+                                        repo->store_id, repo->version, data)) {
         error = "Invalid file id\n";
         goto bad_req;
     }
 
-    if (strcmp(operation, "download-dir") == 0) {
-        if (do_dir(req, repo, id, filename, operation, key) < 0) {
+    if (!repo->encrypted && byte_ranges) {
+        if (do_file_range (req, repo, data, filename, operation, byte_ranges) < 0) {
             error = "Internal server error\n";
             goto bad_req;
         }
-
-    } else if (!repo->encrypted && byte_ranges) {
-        if (do_file_range (req, repo, id, filename, operation, byte_ranges) < 0) {
-            error = "Internal server error\n";
-            goto bad_req;
-        }
-    } else if (do_file(req, repo, id, filename, operation, key) < 0) {
+    } else if (do_file(req, repo, data, filename, operation, key) < 0) {
         error = "Internal server error\n";
         goto bad_req;
     }
@@ -1362,31 +1421,8 @@ access_blks_cb(evhtp_request_t *req, void *arg)
         goto bad_req;
     }
 
-    if (evhtp_kv_find (req->headers_in, "If-Modified-Since") != NULL) {
-        evhtp_send_reply (req, EVHTP_RES_NOTMOD);
+    if (can_use_cached_content (req)) {
         goto success;
-    } else {
-        char http_date[256];
-        evhtp_kv_t *kv;
-        time_t now = time(NULL);
-
-        /* Set Last-Modified header if the client gets this file
-         * for the first time. So that the client will set
-         * If-Modified-Since header the next time it gets the same
-         * file.
-         */
-#ifndef WIN32
-        strftime (http_date, sizeof(http_date), "%a, %d %b %Y %T GMT",
-                  gmtime(&now));
-#else
-        strftime (http_date, sizeof(http_date), "%a, %d %b %Y %H:%M:%S GMT",
-                  gmtime(&now));
-#endif
-        kv = evhtp_kv_new ("Last-Modified", http_date, 1, 1);
-        evhtp_kvs_add_kv (req->headers_out, kv);
-
-        kv = evhtp_kv_new ("Cache-Control", "max-age=3600", 1, 1);
-        evhtp_kvs_add_kv (req->headers_out, kv);
     }
 
     repo_id = seafile_web_access_get_repo_id (webaccess);
@@ -1437,7 +1473,8 @@ int
 access_file_init (evhtp_t *htp)
 {
     evhtp_set_regex_cb (htp, "^/files/.*", access_cb, NULL);
-    /* evhtp_set_regex_cb (htp, "^/blks/.*", access_blks_cb, NULL); */
+    evhtp_set_regex_cb (htp, "^/blks/.*", access_blks_cb, NULL);
+    evhtp_set_regex_cb (htp, "^/zip/.*", access_zip_cb, NULL);
 
     return 0;
 }

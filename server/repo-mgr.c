@@ -21,8 +21,6 @@
 #include "seafile-error.h"
 #include "seafile-crypt.h"
 
-#include "monitor-rpc-wrappers.h"
-
 #include "seaf-db.h"
 
 #define REAP_TOKEN_INTERVAL 300 /* 5 mins */
@@ -489,8 +487,22 @@ remove_virtual_repo_ondisk (SeafRepoManager *mgr,
                                  1, "string", repo_id);
     }
 
-    seaf_db_statement_query (db, "DELETE FROM RepoUserToken WHERE repo_id = ?",
+    seaf_db_statement_query (mgr->seaf->db,
+                             "DELETE FROM RepoUserToken WHERE repo_id = ?",
                              1, "string", repo_id);
+
+    seaf_db_statement_query (mgr->seaf->db,
+                             "DELETE FROM RepoValidSince WHERE repo_id = ?",
+                             1, "string", repo_id);
+
+    seaf_db_statement_query (mgr->seaf->db,
+                             "DELETE FROM RepoSize WHERE repo_id = ?",
+                             1, "string", repo_id);
+
+    /* For GC commit objects for this virtual repo. Fs and blocks are GC
+     * from the parent repo.
+     */
+    add_deleted_repo_record (mgr, repo_id);
 
     return 0;
 }
@@ -550,10 +562,9 @@ seaf_repo_manager_del_repo (SeafRepoManager *mgr,
     }
 
     if (add_deleted_repo_to_trash (mgr, repo_id, head_commit) < 0) {
-        seaf_commit_unref (head_commit);
-        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
-                     "Failed to remove repo to trash ");
-        return -1;
+        // Add repo to trash failed, del repo directly
+        seaf_warning ("Failed to add repo %.8s to trash, delete directly.\n",
+                      repo_id);
     }
 
     seaf_commit_unref (head_commit);
@@ -590,7 +601,20 @@ del_repo:
                                  1, "string", repo_id);
     }
 
-    seaf_db_statement_query (mgr->seaf->db, "DELETE FROM RepoUserToken WHERE repo_id = ?",
+    seaf_db_statement_query (mgr->seaf->db,
+                             "DELETE FROM RepoUserToken WHERE repo_id = ?",
+                             1, "string", repo_id);
+
+    seaf_db_statement_query (mgr->seaf->db,
+                             "DELETE FROM RepoHistoryLimit WHERE repo_id = ?",
+                             1, "string", repo_id);
+
+    seaf_db_statement_query (mgr->seaf->db,
+                             "DELETE FROM RepoValidSince WHERE repo_id = ?",
+                             1, "string", repo_id);
+
+    seaf_db_statement_query (mgr->seaf->db,
+                             "DELETE FROM RepoSize WHERE repo_id = ?",
                              1, "string", repo_id);
 
     /* Remove virtual repos when origin repo is deleted. */
@@ -859,7 +883,9 @@ create_tables_mysql (SeafRepoManager *mgr)
         "peer_id CHAR(41), "
         "peer_ip VARCHAR(41), "
         "peer_name VARCHAR(255), "
-        "sync_time BIGINT)";
+        "sync_time BIGINT, "
+        "client_ver VARCHAR(20))"
+        "ENGINE=INNODB";
     if (seaf_db_query (db, sql) < 0)
         return -1;
 
@@ -909,6 +935,12 @@ create_tables_mysql (SeafRepoManager *mgr)
         "repo_name VARCHAR(255), head_id CHAR(40), owner_id VARCHAR(255),"
         "size BIGINT(20), org_id INTEGER, del_time BIGINT, "
         "INDEX(owner_id), INDEX(org_id))ENGINE=INNODB";
+    if (seaf_db_query (db, sql) < 0)
+        return -1;
+
+    sql = "CREATE TABLE IF NOT EXISTS RepoFileCount ("
+        "repo_id CHAR(36) PRIMARY KEY,"
+        "file_count BIGINT UNSIGNED)ENGINE=INNODB";
     if (seaf_db_query (db, sql) < 0)
         return -1;
 
@@ -988,7 +1020,8 @@ create_tables_sqlite (SeafRepoManager *mgr)
         "peer_id CHAR(41), "
         "peer_ip VARCHAR(41), "
         "peer_name VARCHAR(255), "
-        "sync_time BIGINT)";
+        "sync_time BIGINT, "
+        "client_ver VARCHAR(20))";
     if (seaf_db_query (db, sql) < 0)
         return -1;
 
@@ -1044,6 +1077,12 @@ create_tables_sqlite (SeafRepoManager *mgr)
         return -1;
 
     sql = "CREATE INDEX IF NOT EXISTS repotrash_org_id_idx ON RepoTrash(org_id)";
+    if (seaf_db_query (db, sql) < 0)
+        return -1;
+
+    sql = "CREATE TABLE IF NOT EXISTS RepoFileCount ("
+        "repo_id CHAR(36) PRIMARY KEY,"
+        "file_count BIGINT UNSIGNED)";
     if (seaf_db_query (db, sql) < 0)
         return -1;
 
@@ -1115,7 +1154,8 @@ create_tables_pgsql (SeafRepoManager *mgr)
         "peer_id CHAR(40), "
         "peer_ip VARCHAR(40), "
         "peer_name VARCHAR(255), "
-        "sync_time BIGINT)";
+        "sync_time BIGINT, "
+        "client_ver VARCHAR(20))";
     if (seaf_db_query (db, sql) < 0)
         return -1;
 
@@ -1178,10 +1218,16 @@ create_tables_pgsql (SeafRepoManager *mgr)
             return -1;
     }
 
+    sql = "CREATE TABLE IF NOT EXISTS RepoFileCount ("
+        "repo_id CHAR(36) PRIMARY KEY,"
+        "file_count BIGINT)";
+    if (seaf_db_query (db, sql) < 0)
+        return -1;
+
     return 0;
 }
 
-static int 
+static int
 create_db_tables_if_not_exist (SeafRepoManager *mgr)
 {
     SeafDB *db = mgr->seaf->db;
@@ -1263,18 +1309,20 @@ seaf_repo_manager_add_token_peer_info (SeafRepoManager *mgr,
                                        const char *peer_id,
                                        const char *peer_ip,
                                        const char *peer_name,
-                                       gint64 sync_time)
+                                       gint64 sync_time,
+                                       const char *client_ver)
 {
     int ret = 0;
 
     if (seaf_db_statement_query (mgr->seaf->db,
                                  "INSERT INTO RepoTokenPeerInfo VALUES ("
-                                 "?, ?, ?, ?, ?)",
-                                 5, "string", token,
+                                 "?, ?, ?, ?, ?, ?)",
+                                 6, "string", token,
                                  "string", peer_id,
                                  "string", peer_ip,
                                  "string", peer_name,
-                                 "int64", sync_time) < 0)
+                                 "int64", sync_time,
+                                 "string", client_ver) < 0)
         ret = -1;
 
     return ret;
@@ -1284,15 +1332,17 @@ int
 seaf_repo_manager_update_token_peer_info (SeafRepoManager *mgr,
                                           const char *token,
                                           const char *peer_ip,
-                                          gint64 sync_time)
+                                          gint64 sync_time,
+                                          const char *client_ver)
 {
     int ret = 0;
 
     if (seaf_db_statement_query (mgr->seaf->db,
                                  "UPDATE RepoTokenPeerInfo SET "
-                                 "peer_ip=?, sync_time=? WHERE token=?",
-                                 3, "string", peer_ip,
+                                 "peer_ip=?, sync_time=?, client_ver=? WHERE token=?",
+                                 4, "string", peer_ip,
                                  "int64", sync_time,
+                                 "string", client_ver,
                                  "string", token) < 0)
         ret = -1;
 
@@ -1357,6 +1407,7 @@ collect_repo_token (SeafDBRow *row, void *data)
     const char *repo_id, *repo_owner, *email, *token;
     const char *peer_id, *peer_ip, *peer_name;
     gint64 sync_time;
+    const char *client_ver;
 
     repo_id = seaf_db_row_get_column_text (row, 0);
     repo_owner = seaf_db_row_get_column_text (row, 1);
@@ -1367,6 +1418,7 @@ collect_repo_token (SeafDBRow *row, void *data)
     peer_ip = seaf_db_row_get_column_text (row, 5);
     peer_name = seaf_db_row_get_column_text (row, 6);
     sync_time = seaf_db_row_get_column_int64 (row, 7);
+    client_ver = seaf_db_row_get_column_text (row, 8);
 
     char *owner_l = g_ascii_strdown (repo_owner, -1);
     char *email_l = g_ascii_strdown (email, -1);
@@ -1381,10 +1433,14 @@ collect_repo_token (SeafDBRow *row, void *data)
                                     "peer_ip", peer_ip,
                                     "peer_name", peer_name,
                                     "sync_time", sync_time,
+                                    "client_ver", client_ver,
                                     NULL);
 
     *ret_list = g_list_prepend (*ret_list, repo_token_info);
-    
+
+    g_free (owner_l);
+    g_free (email_l);
+
     return TRUE;
 }
 
@@ -1428,7 +1484,7 @@ seaf_repo_manager_list_repo_tokens (SeafRepoManager *mgr,
     }
 
     sql = "SELECT u.repo_id, o.owner_id, u.email, u.token, "
-        "p.peer_id, p.peer_ip, p.peer_name, p.sync_time "
+        "p.peer_id, p.peer_ip, p.peer_name, p.sync_time, p.client_ver "
         "FROM RepoUserToken u LEFT JOIN RepoTokenPeerInfo p "
         "ON u.token = p.token, RepoOwner o "
         "WHERE u.repo_id = ? and o.repo_id = ? ";
@@ -1457,7 +1513,7 @@ seaf_repo_manager_list_repo_tokens_by_email (SeafRepoManager *mgr,
     char *sql;
 
     sql = "SELECT u.repo_id, o.owner_id, u.email, u.token, "
-        "p.peer_id, p.peer_ip, p.peer_name, p.sync_time "
+        "p.peer_id, p.peer_ip, p.peer_name, p.sync_time, p.client_ver "
         "FROM RepoUserToken u LEFT JOIN RepoTokenPeerInfo p "
         "ON u.token = p.token, RepoOwner o "
         "WHERE u.email = ? and u.repo_id = o.repo_id";
@@ -1715,7 +1771,7 @@ seaf_repo_manager_set_repo_history_limit (SeafRepoManager *mgr,
 
         if (exists)
             rc = seaf_db_statement_query (db,
-                                          "UPDATE RepoHistoryLimit SET days=%d"
+                                          "UPDATE RepoHistoryLimit SET days=%d "
                                           "WHERE repo_id=?",
                                           2, "int", days, "string", repo_id);
         else
@@ -1734,6 +1790,16 @@ seaf_repo_manager_set_repo_history_limit (SeafRepoManager *mgr,
     return 0;
 }
 
+static gboolean
+get_history_limit_cb (SeafDBRow *row, void *data)
+{
+    int *limit = data;
+
+    *limit = seaf_db_row_get_column_int (row, 0);
+
+    return FALSE;
+}
+
 int
 seaf_repo_manager_get_repo_history_limit (SeafRepoManager *mgr,
                                           const char *repo_id)
@@ -1741,21 +1807,27 @@ seaf_repo_manager_get_repo_history_limit (SeafRepoManager *mgr,
     SeafVirtRepo *vinfo;
     const char *r_repo_id = repo_id;
     char *sql;
-    int per_repo_days;
+    int per_repo_days = -1;
+    int ret;
 
     vinfo = seaf_repo_manager_get_virtual_repo_info (mgr, repo_id);
     if (vinfo)
         r_repo_id = vinfo->origin_repo_id;
 
     sql = "SELECT days FROM RepoHistoryLimit WHERE repo_id=?";
-    per_repo_days = seaf_db_statement_get_int (mgr->seaf->db, sql,
-                                               1, "string", r_repo_id);
+
+    ret = seaf_db_statement_foreach_row (mgr->seaf->db, sql, get_history_limit_cb,
+                                         &per_repo_days, 1, "string", r_repo_id);
+    if (ret == 0) {
+        // limit not set, return global one
+        per_repo_days = mgr->seaf->keep_history_days;
+    }
+
+    // db error or limit set as negative, means keep full history, return -1
+    if (per_repo_days < 0)
+        per_repo_days = -1;
 
     seaf_virtual_repo_info_free (vinfo);
-
-    /* If per repo value is not set or DB error, return the global one. */
-    if (per_repo_days < 0)
-        return mgr->seaf->keep_history_days;
 
     return per_repo_days;
 }
@@ -1842,6 +1914,12 @@ seaf_repo_manager_set_repo_owner (SeafRepoManager *mgr,
 {
     SeafDB *db = mgr->seaf->db;
     char sql[256];
+    char *orig_owner = NULL;
+    int ret = 0;
+
+    orig_owner = seaf_repo_manager_get_repo_owner (mgr, repo_id);
+    if (g_strcmp0 (orig_owner, email) == 0)
+        goto out;
 
     if (seaf_db_type(db) == SEAF_DB_TYPE_PGSQL) {
         gboolean err;
@@ -1855,17 +1933,57 @@ seaf_repo_manager_set_repo_owner (SeafRepoManager *mgr,
             snprintf(sql, sizeof(sql),
                      "INSERT INTO RepoOwner VALUES ('%s', '%s')",
                      repo_id, email);
-        if (err)
-            return -1;
-        if (seaf_db_query (db, sql) < 0)
-            return -1;
+        if (err) {
+            ret = -1;
+            goto out;
+        }
+
+        if (seaf_db_query (db, sql) < 0) {
+            ret = -1;
+            goto out;
+        }
     } else {
         if (seaf_db_statement_query (db, "REPLACE INTO RepoOwner VALUES (?, ?)",
-                                     2, "string", repo_id, "string", email) < 0)
-            return -1;
+                                     2, "string", repo_id, "string", email) < 0) {
+            ret = -1;
+            goto out;
+        }
     }
 
-    return 0;
+    /* If the repo was newly created, no need to remove share and virtual repos. */
+    if (!orig_owner)
+        goto out;
+
+    seaf_db_statement_query (mgr->seaf->db, "DELETE FROM SharedRepo WHERE repo_id = ?",
+                             1, "string", repo_id);
+
+    seaf_db_statement_query (mgr->seaf->db, "DELETE FROM RepoGroup WHERE repo_id = ?",
+                             1, "string", repo_id);
+
+    if (!seaf->cloud_mode) {
+        seaf_db_statement_query (mgr->seaf->db, "DELETE FROM InnerPubRepo WHERE repo_id = ?",
+                                 1, "string", repo_id);
+    }
+
+    /* Remove all tokens except for the new owner. */
+    seaf_db_statement_query (mgr->seaf->db,
+                             "DELETE FROM RepoUserToken WHERE repo_id = ? AND email != ?",
+                             2, "string", repo_id, "string", email);
+
+    /* Remove virtual repos when repo ownership changes. */
+    GList *vrepos, *ptr;
+    vrepos = seaf_repo_manager_get_virtual_repo_ids_by_origin (mgr, repo_id);
+    for (ptr = vrepos; ptr != NULL; ptr = ptr->next)
+        remove_virtual_repo_ondisk (mgr, (char *)ptr->data);
+    string_list_free (vrepos);
+
+    seaf_db_statement_query (mgr->seaf->db, "DELETE FROM VirtualRepo "
+                             "WHERE repo_id=? OR origin_repo=?",
+                             2, "string", repo_id, "string", repo_id);
+
+out:
+    g_free (orig_owner);
+    return ret;
 }
 
 static gboolean
@@ -1938,11 +2056,13 @@ seaf_repo_manager_get_orphan_repo_list (SeafRepoManager *mgr)
 
 GList *
 seaf_repo_manager_get_repos_by_owner (SeafRepoManager *mgr,
-                                      const char *email)
+                                      const char *email,
+                                      int ret_corrupted)
 {
     GList *id_list = NULL, *ptr;
     GList *ret = NULL;
     char *sql;
+    SeafRepo *repo = NULL;
 
     sql = "SELECT repo_id FROM RepoOwner WHERE owner_id=?";
 
@@ -1953,7 +2073,11 @@ seaf_repo_manager_get_repos_by_owner (SeafRepoManager *mgr,
 
     for (ptr = id_list; ptr; ptr = ptr->next) {
         char *repo_id = ptr->data;
-        SeafRepo *repo = seaf_repo_manager_get_repo (mgr, repo_id);
+        if (ret_corrupted) {
+            repo = seaf_repo_manager_get_repo_ex (mgr, repo_id);
+        } else {
+            repo = seaf_repo_manager_get_repo (mgr, repo_id);
+        }
         if (repo != NULL)
             ret = g_list_prepend (ret, repo);
     }
@@ -1978,37 +2102,72 @@ seaf_repo_manager_get_repo_id_list (SeafRepoManager *mgr)
     return ret;
 }
 
+typedef struct FileCount {
+    char *repo_id;
+    gint64 file_count;
+} FileCount;
+
+static void
+free_file_count (gpointer data)
+{
+    if (!data)
+        return;
+
+    FileCount *file_count = data;
+    g_free (file_count->repo_id);
+    g_free (file_count);
+}
+
+static gboolean
+get_file_count_cb (SeafDBRow *row, void *data)
+{
+    GList **file_counts = data;
+    const char *repo_id = seaf_db_row_get_column_text (row, 0);
+    gint64 fcount = seaf_db_row_get_column_int64 (row, 1);
+
+    FileCount *file_count = g_new0 (FileCount, 1);
+    file_count->repo_id = g_strdup (repo_id);
+    file_count->file_count = fcount;
+    *file_counts = g_list_prepend (*file_counts, file_count);
+
+    return TRUE;
+}
+
 GList *
 seaf_repo_manager_get_repo_list (SeafRepoManager *mgr, int start, int limit)
 {
-    GList *id_list = NULL, *ptr;
+    GList *file_counts = NULL, *ptr;
     GList *ret = NULL;
     SeafRepo *repo;
+    FileCount *file_count;
     int rc;
 
     if (start == -1 && limit == -1)
         rc = seaf_db_statement_foreach_row (mgr->seaf->db,
-                                       "SELECT repo_id FROM Repo",
-                                       collect_repo_id, &id_list,
-                                       0);
+                                            "SELECT r.repo_id, c.file_count FROM Repo r LEFT JOIN RepoFileCount c "
+                                            "ON r.repo_id = c.repo_id",
+                                            get_file_count_cb, &file_counts,
+                                            0);
     else
         rc = seaf_db_statement_foreach_row (mgr->seaf->db,
-                                            "SELECT repo_id FROM Repo "
-                                            "ORDER BY repo_id LIMIT ? OFFSET ?",
-                                            collect_repo_id, &id_list,
+                                            "SELECT r.repo_id, c.file_count FROM Repo r LEFT JOIN RepoFileCount c "
+                                            "ON r.repo_id = c.repo_id ORDER BY r.repo_id LIMIT ? OFFSET ?",
+                                            get_file_count_cb, &file_counts,
                                             2, "int", limit, "int", start);
 
     if (rc < 0)
         return NULL;
 
-    for (ptr = id_list; ptr; ptr = ptr->next) {
-        char *repo_id = ptr->data;
-        repo = seaf_repo_manager_get_repo_ex (mgr, repo_id);
-        if (repo != NULL)
+    for (ptr = file_counts; ptr; ptr = ptr->next) {
+        file_count = ptr->data;
+        repo = seaf_repo_manager_get_repo_ex (mgr, file_count->repo_id);
+        if (repo != NULL) {
+            repo->file_count = file_count->file_count;
             ret = g_list_prepend (ret, repo);
+        }
     }
 
-    string_list_free (id_list);
+    g_list_free_full (file_counts, free_file_count);
 
     return ret;
 }
@@ -2095,14 +2254,14 @@ seaf_repo_manager_get_trash_repo_list (SeafRepoManager *mgr,
     if (start == -1 && limit == -1)
         rc = seaf_db_statement_foreach_row (mgr->seaf->db,
                                             "SELECT repo_id, repo_name, head_id, owner_id, "
-                                            "size, del_time FROM RepoTrash",
+                                            "size, del_time FROM RepoTrash ORDER BY del_time DESC",
                                             collect_trash_repo, &trash_repos,
                                             0);
     else
         rc = seaf_db_statement_foreach_row (mgr->seaf->db,
                                             "SELECT repo_id, repo_name, head_id, owner_id, "
                                             "size, del_time FROM RepoTrash "
-                                            "ORDER BY repo_id LIMIT ? OFFSET ?",
+                                            "ORDER BY del_time DESC LIMIT ? OFFSET ?",
                                             collect_trash_repo, &trash_repos,
                                             2, "int", limit, "int", start);
 
@@ -2116,7 +2275,7 @@ seaf_repo_manager_get_trash_repo_list (SeafRepoManager *mgr,
         return NULL;
     }
 
-    return trash_repos;
+    return g_list_reverse (trash_repos);
 }
 
 GList *
@@ -2319,6 +2478,26 @@ seaf_repo_manager_restore_repo_from_trash (SeafRepoManager *mgr,
         if (ret < 0) {
             g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
                          "DB error: Set RepoHead.");
+            seaf_db_rollback (trans);
+            seaf_db_trans_close (trans);
+            goto out;
+        }
+    }
+
+    // Restore repo size
+    exists = seaf_db_trans_check_for_existence (trans,
+                                                "SELECT 1 FROM RepoSize WHERE repo_id=?",
+                                                &db_err, 1, "string", repo_id);
+
+    if (!exists) {
+        ret = seaf_db_trans_query (trans,
+                                   "INSERT INTO RepoSize VALUES (?, ?, ?)",
+                                   3, "string", repo_id,
+                                   "int64", seafile_trash_repo_get_size (repo),
+                                   "string", seafile_trash_repo_get_head_id (repo));
+        if (ret < 0) {
+            g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
+                         "DB error: Insert Repo Size.");
             seaf_db_rollback (trans);
             seaf_db_trans_close (trans);
             goto out;

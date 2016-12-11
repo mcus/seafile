@@ -2,6 +2,8 @@
 
 #include "common.h"
 
+#include "net.h"
+
 #include <pthread.h>
 #include <curl/curl.h>
 #include <jansson.h>
@@ -415,6 +417,7 @@ create_ca_bundle (const char *ca_bundle_path)
 
 #endif	/* WIN32 */
 
+#ifndef __linux__
 static void
 load_ca_bundle (CURL *curl)
 {
@@ -432,7 +435,7 @@ load_ca_bundle (CURL *curl)
 
     curl_easy_setopt (curl, CURLOPT_CAINFO, ca_bundle_path);
 }
-
+#endif  /* __linux__ */
 
 static gboolean
 load_certs (sqlite3_stmt *stmt, void *vdata)
@@ -532,8 +535,11 @@ ssl_callback (CURL *curl, void *ssl_ctx, void *userptr)
 static void
 set_proxy (CURL *curl, gboolean is_https)
 {
-    if (!seaf->use_http_proxy || !seaf->http_proxy_type || !seaf->http_proxy_addr)
+    /* Disable proxy if proxy options are not set properly. */
+    if (!seaf->use_http_proxy || !seaf->http_proxy_type || !seaf->http_proxy_addr) {
+        curl_easy_setopt (curl, CURLOPT_PROXY, NULL);
         return;
+    }
 
     if (g_strcmp0(seaf->http_proxy_type, PROXY_TYPE_HTTP) == 0) {
         curl_easy_setopt(curl, CURLOPT_PROXYTYPE, CURLPROXY_HTTP);
@@ -562,6 +568,41 @@ set_proxy (CURL *curl, gboolean is_https)
     }
 }
 
+#ifdef WIN32
+static int
+sockopt_callback (void *clientp, curl_socket_t curlfd, curlsocktype purpose)
+{
+    /* Set large enough TCP buffer size.
+     * This greatly enhances sync speed for high latency network.
+     * Windows by default use 8KB buffers, which is too small for such case.
+     * Linux has auto-tuning for TCP buffers, so don't need to set manually.
+     * OSX is TBD.
+     */
+
+#define DEFAULT_SNDBUF_SIZE (1 << 17) /* 128KB */
+
+    /* Set send buffer size. */
+    int sndbuf_size;
+    socklen_t optlen;
+
+    optlen = sizeof(int);
+    getsockopt (curlfd, SOL_SOCKET, SO_SNDBUF, (char *)&sndbuf_size, &optlen);
+
+    if (sndbuf_size < DEFAULT_SNDBUF_SIZE) {
+        sndbuf_size = DEFAULT_SNDBUF_SIZE;
+        optlen = sizeof(int);
+        setsockopt (curlfd, SOL_SOCKET, SO_SNDBUF, (char *)&sndbuf_size, optlen);
+    }
+
+    /* Disable Nagle's algorithm. */
+    int val = 1;
+    optlen = sizeof(int);
+    setsockopt (curlfd, IPPROTO_TCP, TCP_NODELAY, (char *)&val, optlen);
+
+    return CURL_SOCKOPT_OK;
+}
+#endif  /* WIN32 */
+
 typedef struct _HttpResponse {
     char *content;
     size_t size;
@@ -586,7 +627,7 @@ recv_response (void *contents, size_t size, size_t nmemb, void *userp)
     return realsize;
 }
 
-#define HTTP_TIMEOUT_SEC 45
+#define HTTP_TIMEOUT_SEC 120
 
 typedef size_t (*HttpRecvCallback) (void *, size_t, size_t, void *);
 
@@ -655,6 +696,10 @@ http_get (CURL *curl, const char *url, const char *token,
         curl_easy_setopt (curl, CURLOPT_SSL_CTX_FUNCTION, ssl_callback);
         curl_easy_setopt (curl, CURLOPT_SSL_CTX_DATA, url);
     }
+
+#ifdef WIN32
+    curl_easy_setopt (curl, CURLOPT_SOCKOPTFUNCTION, sockopt_callback);
+#endif
 
     int rc = curl_easy_perform (curl);
     if (rc != 0) {
@@ -787,6 +832,10 @@ http_put (CURL *curl, const char *url, const char *token,
         curl_easy_setopt (curl, CURLOPT_SSL_CTX_DATA, url);
     }
 
+#ifdef WIN32
+    curl_easy_setopt (curl, CURLOPT_SOCKOPTFUNCTION, sockopt_callback);
+#endif
+
     int rc = curl_easy_perform (curl);
     if (rc != 0) {
         seaf_warning ("libcurl failed to PUT %s: %s.\n",
@@ -887,6 +936,10 @@ http_post (CURL *curl, const char *url, const char *token,
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     /* All POST requests should remain POST after redirect. */
     curl_easy_setopt(curl, CURLOPT_POSTREDIR, CURL_REDIR_POST_ALL);
+
+#ifdef WIN32
+    curl_easy_setopt (curl, CURLOPT_SOCKOPTFUNCTION, sockopt_callback);
+#endif
 
     int rc = curl_easy_perform (curl);
     if (rc != 0) {
@@ -1100,12 +1153,16 @@ http_tx_manager_check_protocol_version (HttpTxManager *manager,
     data->callback = callback;
     data->user_data = user_data;
 
-    ccnet_job_manager_schedule_job (seaf->job_mgr,
-                                    check_protocol_version_thread,
-                                    check_protocol_version_done,
-                                    data);
+    int ret = ccnet_job_manager_schedule_job (seaf->job_mgr,
+                                              check_protocol_version_thread,
+                                              check_protocol_version_done,
+                                              data);
+    if (ret < 0) {
+        g_free (data->host);
+        g_free (data);
+    }
 
-    return 0;
+    return ret;
 }
 
 /* Check Head Commit. */
@@ -1255,10 +1312,15 @@ http_tx_manager_check_head_commit (HttpTxManager *manager,
     data->user_data = user_data;
     data->use_fileserver_port = use_fileserver_port;
 
-    ccnet_job_manager_schedule_job (seaf->job_mgr,
-                                    check_head_commit_thread,
-                                    check_head_commit_done,
-                                    data);
+    if (ccnet_job_manager_schedule_job (seaf->job_mgr,
+                                        check_head_commit_thread,
+                                        check_head_commit_done,
+                                        data) < 0) {
+        g_free (data->host);
+        g_free (data->token);
+        g_free (data);
+        return -1;
+    }
 
     return 0;
 }
@@ -1604,10 +1666,14 @@ http_tx_manager_get_folder_perms (HttpTxManager *manager,
     data->user_data = user_data;
     data->use_fileserver_port = use_fileserver_port;
 
-    ccnet_job_manager_schedule_job (seaf->job_mgr,
-                                    get_folder_perms_thread,
-                                    get_folder_perms_done,
-                                    data);
+    if (ccnet_job_manager_schedule_job (seaf->job_mgr,
+                                        get_folder_perms_thread,
+                                        get_folder_perms_done,
+                                        data) < 0) {
+        g_free (data->host);
+        g_free (data);
+        return -1;
+    }
 
     return 0;
 }
@@ -1684,7 +1750,7 @@ parse_locked_files (const char *rsp_content, int rsp_size, GetLockedFilesData *d
     json_error_t jerror;
     size_t n;
     int i;
-    GList *results = NULL, *ptr;
+    GList *results = NULL;
     HttpLockedFilesRes *res;
     const char *repo_id;
     int ret = 0;
@@ -1794,7 +1860,6 @@ get_locked_files_thread (void *vdata)
     int status;
     char *rsp_content = NULL;
     gint64 rsp_size;
-    GList *ptr;
 
     pool = find_connection_pool (priv, data->host);
     if (!pool) {
@@ -1877,12 +1942,128 @@ http_tx_manager_get_locked_files (HttpTxManager *manager,
     data->user_data = user_data;
     data->use_fileserver_port = use_fileserver_port;
 
-    ccnet_job_manager_schedule_job (seaf->job_mgr,
-                                    get_locked_files_thread,
-                                    get_locked_files_done,
-                                    data);
+    if (ccnet_job_manager_schedule_job (seaf->job_mgr,
+                                        get_locked_files_thread,
+                                        get_locked_files_done,
+                                        data) < 0) {
+        g_free (data->host);
+        g_free (data);
+        return -1;
+    }
 
     return 0;
+}
+
+/* Synchronous interfaces for locking/unlocking a file on the server. */
+
+int
+http_tx_manager_lock_file (HttpTxManager *manager,
+                           const char *host,
+                           gboolean use_fileserver_port,
+                           const char *token,
+                           const char *repo_id,
+                           const char *path)
+{
+    HttpTxPriv *priv = seaf->http_tx_mgr->priv;
+    ConnectionPool *pool;
+    Connection *conn;
+    CURL *curl;
+    char *url;
+    int status;
+    int ret = 0;
+
+    pool = find_connection_pool (priv, host);
+    if (!pool) {
+        seaf_warning ("Failed to create connection pool for host %s.\n", host);
+        return -1;
+    }
+
+    conn = connection_pool_get_connection (pool);
+    if (!conn) {
+        seaf_warning ("Failed to get connection to host %s.\n", host);
+        return -1;
+    }
+
+    curl = conn->curl;
+
+    char *esc_path = g_uri_escape_string(path, NULL, FALSE);
+    if (!use_fileserver_port)
+        url = g_strdup_printf ("%s/seafhttp/repo/%s/lock-file?p=%s", host, repo_id, esc_path);
+    else
+        url = g_strdup_printf ("%s/repo/%s/lock-file?p=%s", host, repo_id, esc_path);
+    g_free (esc_path);
+
+    if (http_put (curl, url, token, NULL, 0, NULL, NULL,
+                  &status, NULL, NULL, FALSE) < 0) {
+        conn->release = TRUE;
+        ret = -1;
+        goto out;
+    }
+
+    if (status != HTTP_OK) {
+        seaf_warning ("Bad response code for PUT %s: %d.\n", url, status);
+        ret = -1;
+    }
+
+out:
+    g_free (url);
+    connection_pool_return_connection (pool, conn);
+    return ret;
+}
+
+int
+http_tx_manager_unlock_file (HttpTxManager *manager,
+                             const char *host,
+                             gboolean use_fileserver_port,
+                             const char *token,
+                             const char *repo_id,
+                             const char *path)
+{
+    HttpTxPriv *priv = seaf->http_tx_mgr->priv;
+    ConnectionPool *pool;
+    Connection *conn;
+    CURL *curl;
+    char *url;
+    int status;
+    int ret = 0;
+
+    pool = find_connection_pool (priv, host);
+    if (!pool) {
+        seaf_warning ("Failed to create connection pool for host %s.\n", host);
+        return -1;
+    }
+
+    conn = connection_pool_get_connection (pool);
+    if (!conn) {
+        seaf_warning ("Failed to get connection to host %s.\n", host);
+        return -1;
+    }
+
+    curl = conn->curl;
+
+    char *esc_path = g_uri_escape_string(path, NULL, FALSE);
+    if (!use_fileserver_port)
+        url = g_strdup_printf ("%s/seafhttp/repo/%s/unlock-file?p=%s", host, repo_id, esc_path);
+    else
+        url = g_strdup_printf ("%s/repo/%s/unlock-file?p=%s", host, repo_id, esc_path);
+    g_free (esc_path);
+
+    if (http_put (curl, url, token, NULL, 0, NULL, NULL,
+                  &status, NULL, NULL, FALSE) < 0) {
+        conn->release = TRUE;
+        ret = -1;
+        goto out;
+    }
+
+    if (status != HTTP_OK) {
+        seaf_warning ("Bad response code for PUT %s: %d.\n", url, status);
+        ret = -1;
+    }
+
+out:
+    g_free (url);
+    connection_pool_return_connection (pool, conn);
+    return ret;
 }
 
 static gboolean
@@ -1919,8 +2100,8 @@ check_permission (HttpTxTask *task, Connection *conn)
 
     const char *type = (task->type == HTTP_TASK_TYPE_DOWNLOAD) ? "download" : "upload";
     const char *url_prefix = (task->use_fileserver_port) ? "" : "seafhttp/";
-    if (seaf->session->base.name) {
-        char *client_name = g_uri_escape_string (seaf->session->base.name,
+    if (seaf->client_name) {
+        char *client_name = g_uri_escape_string (seaf->client_name,
                                                  NULL, FALSE);
         url = g_strdup_printf ("%s/%srepo/%s/permission-check/?op=%s"
                                "&client_id=%s&client_name=%s",
@@ -1989,7 +2170,7 @@ http_tx_manager_add_upload (HttpTxManager *manager,
 
     task->protocol_version = protocol_version;
 
-    task->state = TASK_STATE_NORMAL;
+    task->state = HTTP_TASK_STATE_NORMAL;
 
     task->use_fileserver_port = use_fileserver_port;
 
@@ -1997,10 +2178,13 @@ http_tx_manager_add_upload (HttpTxManager *manager,
                          g_strdup(repo_id),
                          task);
 
-    ccnet_job_manager_schedule_job (seaf->job_mgr,
-                                    http_upload_thread,
-                                    http_upload_done,
-                                    task);
+    if (ccnet_job_manager_schedule_job (seaf->job_mgr,
+                                        http_upload_thread,
+                                        http_upload_done,
+                                        task) < 0) {
+        g_hash_table_remove (manager->priv->upload_tasks, repo_id);
+        return -1;
+    }
 
     return 0;
 }
@@ -2529,7 +2713,7 @@ send_fs_objects (HttpTxTask *task, Connection *conn, GList **send_fs_list)
                                task->host, task->repo_id);
 
     if (http_post (curl, url, task->token,
-                   package, evbuffer_get_length(buf),
+                   (char *)package, evbuffer_get_length(buf),
                    &status, NULL, NULL, FALSE) < 0) {
         conn->release = TRUE;
         task->error = HTTP_TASK_ERR_NET;
@@ -2933,8 +3117,12 @@ multi_threaded_send_blocks (HttpTxTask *http_task, GList *block_list)
         task = g_new0 (BlockUploadTask, 1);
         memcpy (task->block_id, block_id, 40);
 
-        g_hash_table_insert (pending_tasks, g_strdup(block_id), task);
-        g_thread_pool_push (tpool, task, NULL);
+        if (!g_hash_table_lookup (pending_tasks, block_id)) {
+            g_hash_table_insert (pending_tasks, g_strdup(block_id), task);
+            g_thread_pool_push (tpool, task, NULL);
+        } else {
+            g_free (task);
+        }
     }
 
     while ((task = g_async_queue_pop (finished_tasks)) != NULL) {
@@ -2943,6 +3131,8 @@ multi_threaded_send_blocks (HttpTxTask *http_task, GList *block_list)
             http_task->all_stop = TRUE;
             break;
         }
+
+        ++(http_task->done_blocks);
 
         g_hash_table_remove (pending_tasks, task->block_id);
         if (g_hash_table_size(pending_tasks) == 0)
@@ -3052,7 +3242,6 @@ http_upload_thread (void *vdata)
     char *url = NULL;
     GList *send_fs_list = NULL, *needed_fs_list = NULL;
     GList *block_list = NULL, *needed_block_list = NULL;
-    GList *ptr;
     GHashTable *active_paths = NULL;
 
     SeafBranch *local = seaf_branch_manager_get_branch (seaf->branch_mgr,
@@ -3060,7 +3249,7 @@ http_upload_thread (void *vdata)
     if (!local) {
         seaf_warning ("Failed to get branch local of repo %.8s.\n", task->repo_id);
         task->error = HTTP_TASK_ERR_BAD_LOCAL_DATA;
-        goto out;
+        return NULL;
     }
     memcpy (task->head, local->commit_id, 40);
     seaf_branch_unref (local);
@@ -3292,7 +3481,7 @@ http_tx_manager_add_download (HttpTxManager *manager,
     task->protocol_version = protocol_version;
     task->email = g_strdup(email);
 
-    task->state = TASK_STATE_NORMAL;
+    task->state = HTTP_TASK_STATE_NORMAL;
 
     task->use_fileserver_port = use_fileserver_port;
 
@@ -3309,10 +3498,13 @@ http_tx_manager_add_download (HttpTxManager *manager,
                                                NULL);
     task->repo_name = g_strdup(repo_name);
 
-    ccnet_job_manager_schedule_job (seaf->job_mgr,
-                                    http_download_thread,
-                                    http_download_done,
-                                    task);
+    if (ccnet_job_manager_schedule_job (seaf->job_mgr,
+                                        http_download_thread,
+                                        http_download_done,
+                                        task) < 0) {
+        g_hash_table_remove (manager->priv->download_tasks, repo_id);
+        return -1;
+    }
 
     return 0;
 }
@@ -3443,6 +3635,8 @@ get_needed_fs_id_list (HttpTxTask *task, Connection *conn, GList **fs_id_list)
     seaf_debug ("Received fs object list size %lu from %s:%s.\n",
                 n, task->host, task->repo_id);
 
+    task->n_fs_objs = (int)n;
+
     GHashTable *checked_objs = g_hash_table_new_full (g_str_hash, g_str_equal,
                                                       g_free, NULL);
 
@@ -3458,8 +3652,10 @@ get_needed_fs_id_list (HttpTxTask *task, Connection *conn, GList **fs_id_list)
 
         obj_id = json_string_value(str);
 
-        if (g_hash_table_lookup (checked_objs, obj_id))
+        if (g_hash_table_lookup (checked_objs, obj_id)) {
+            ++(task->done_fs_objs);
             continue;
+        }
         char *key = g_strdup(obj_id);
         g_hash_table_replace (checked_objs, key, key);
 
@@ -3473,8 +3669,13 @@ get_needed_fs_id_list (HttpTxTask *task, Connection *conn, GList **fs_id_list)
             sound = seaf_fs_manager_verify_object (seaf->fs_mgr,
                                                    task->repo_id, task->repo_version,
                                                    obj_id, FALSE, &io_error);
-            if (!sound && !io_error)
+            if (!sound && !io_error) {
                 *fs_id_list = g_list_prepend (*fs_id_list, g_strdup(obj_id));
+            } else {
+                ++(task->done_fs_objs);
+            }
+        } else {
+            ++(task->done_fs_objs);
         }
     }
 
@@ -3495,7 +3696,6 @@ static int
 get_fs_objects (HttpTxTask *task, Connection *conn, GList **fs_list)
 {
     json_t *array;
-    json_error_t jerror;
     char *obj_id;
     int n_sent = 0;
     char *data = NULL;
@@ -3595,6 +3795,8 @@ get_fs_objects (HttpTxTask *task, Connection *conn, GList **fs_list)
         }
 
         g_hash_table_remove (requested, recv_obj_id);
+
+        ++(task->done_fs_objs);
 
         p += (sizeof(ObjectHeader) + size);
         n += (sizeof(ObjectHeader) + size);
@@ -4107,12 +4309,12 @@ http_tx_manager_cancel_task (HttpTxManager *manager,
     }
 
     if (task->runtime_state == HTTP_TASK_RT_STATE_INIT) {
-        transition_state (task, TASK_STATE_CANCELED, TASK_RT_STATE_FINISHED);
+        transition_state (task, HTTP_TASK_STATE_CANCELED, TASK_RT_STATE_FINISHED);
         return;
     }
 
     /* Only change state. runtime_state will be changed in worker thread. */
-    transition_state (task, TASK_STATE_CANCELED, task->runtime_state);
+    transition_state (task, HTTP_TASK_STATE_CANCELED, task->runtime_state);
 }
 
 int

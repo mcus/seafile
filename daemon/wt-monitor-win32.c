@@ -675,10 +675,10 @@ static HANDLE add_watch (SeafWTMonitorPriv *priv,
 
     pthread_mutex_lock (&priv->hash_lock);
     g_hash_table_insert (priv->handle_hash,
-                         g_strdup(repo_id), (gpointer)(long)dir_handle);
+                         g_strdup(repo_id), (gpointer)dir_handle);
 
     info = create_repo_watch_info (repo_id, worktree);
-    g_hash_table_insert (priv->info_hash, (gpointer)(long)dir_handle, info);
+    g_hash_table_insert (priv->info_hash, (gpointer)dir_handle, info);
     pthread_mutex_unlock (&priv->hash_lock);
 
     add_event_to_queue (info->status, WT_EVENT_SCAN_DIR, "", NULL);
@@ -703,8 +703,6 @@ static int handle_add_repo (SeafWTMonitor *monitor,
 
 static int handle_rm_repo (SeafWTMonitorPriv *priv, const char *repo_id, gpointer handle)
 {
-    HANDLE h = (HANDLE)handle;
-
     pthread_mutex_lock (&priv->hash_lock);
     g_hash_table_remove (priv->handle_hash, repo_id);
     g_hash_table_remove (priv->info_hash, handle);

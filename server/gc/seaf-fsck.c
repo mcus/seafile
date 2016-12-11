@@ -12,25 +12,26 @@
 
 static char *config_dir = NULL;
 static char *seafile_dir = NULL;
+static char *central_config_dir = NULL;
 
 CcnetClient *ccnet_client;
 SeafileSession *seaf;
 
-static const char *short_opts = "hvc:d:reE:";
+static const char *short_opts = "hvc:d:rE:F:";
 static const struct option long_opts[] = {
     { "help", no_argument, NULL, 'h', },
     { "version", no_argument, NULL, 'v', },
     { "repair", no_argument, NULL, 'r', },
-    { "enable-sync", no_argument, NULL, 'e', },
     { "export", required_argument, NULL, 'E', },
     { "config-file", required_argument, NULL, 'c', },
+    { "central-config-dir", required_argument, NULL, 'F' },
     { "seafdir", required_argument, NULL, 'd', },
 };
 
 static void usage ()
 {
     fprintf (stderr,
-             "usage: seaf-fsck [-r] [-e] [-E exported_path] [-c config_dir] [-d seafile_dir] "
+             "usage: seaf-fsck [-r] [-E exported_path] [-c config_dir] [-d seafile_dir] "
              "[repo_id_1 [repo_id_2 ...]]\n");
 }
 
@@ -90,7 +91,6 @@ main(int argc, char *argv[])
 {
     int c;
     gboolean repair = FALSE;
-    gboolean esync = FALSE;
     char *export_path = NULL;
 
 #ifdef WIN32
@@ -111,9 +111,6 @@ main(int argc, char *argv[])
         case 'r':
             repair = TRUE;
             break;
-        case 'e':
-            esync = TRUE;
-            break;
         case 'E':
             export_path = strdup(optarg);
             break;
@@ -122,6 +119,9 @@ main(int argc, char *argv[])
             break;
         case 'd':
             seafile_dir = strdup(optarg);
+            break;
+        case 'F':
+            central_config_dir = strdup(optarg);
             break;
         default:
             usage();
@@ -139,7 +139,7 @@ main(int argc, char *argv[])
     }
 
     ccnet_client = ccnet_client_new();
-    if ((ccnet_client_load_confdir(ccnet_client, config_dir)) < 0) {
+    if ((ccnet_client_load_confdir(ccnet_client, central_config_dir, config_dir)) < 0) {
         seaf_warning ("Read config dir error\n");
         return -1;
     }
@@ -156,8 +156,9 @@ main(int argc, char *argv[])
         exit(1);
     }
 #endif
-    
-    seaf = seafile_session_new(seafile_dir, ccnet_client);
+
+    seaf = seafile_session_new(central_config_dir, seafile_dir, ccnet_client,
+                               export_path == NULL);
     if (!seaf) {
         seaf_warning ("Failed to create seafile session.\n");
         exit (1);
@@ -171,7 +172,7 @@ main(int argc, char *argv[])
     if (export_path) {
         export_file (repo_id_list, seafile_dir, export_path);
     } else {
-        seaf_fsck (repo_id_list, repair, esync);
+        seaf_fsck (repo_id_list, repair);
     }
 
     return 0;

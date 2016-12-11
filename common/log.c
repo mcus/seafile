@@ -5,6 +5,12 @@
 #include <stdio.h>
 #include <glib/gstdio.h>
 
+#ifndef WIN32
+#ifdef SEAFILE_SERVER
+#include <sys/syslog.h>
+#endif
+#endif
+
 #include "log.h"
 #include "utils.h"
 
@@ -13,6 +19,33 @@ static int ccnet_log_level;
 static int seafile_log_level;
 static char *logfile;
 static FILE *logfp;
+
+#ifndef WIN32
+#ifdef SEAFILE_SERVER
+static gboolean enable_syslog;
+#endif
+#endif
+
+#ifndef WIN32
+#ifdef SEAFILE_SERVER
+static int
+get_syslog_level (GLogLevelFlags level)
+{
+    switch (level) {
+        case G_LOG_LEVEL_DEBUG:
+            return LOG_DEBUG;
+        case G_LOG_LEVEL_INFO:
+            return LOG_INFO;
+        case G_LOG_LEVEL_WARNING:
+            return LOG_WARNING;
+        case G_LOG_LEVEL_ERROR:
+            return LOG_ERR;
+        default:
+            return LOG_DEBUG;
+    }
+}
+#endif
+#endif
 
 static void 
 seafile_log (const gchar *log_domain, GLogLevelFlags log_level,
@@ -37,6 +70,13 @@ seafile_log (const gchar *log_domain, GLogLevelFlags log_level,
     } else { // log file not available
         printf("%s %s", buf, message);
     }
+
+#ifndef WIN32
+#ifdef SEAFILE_SERVER
+    if (enable_syslog)
+        syslog (get_syslog_level (log_level), "%s", message);
+#endif
+#endif
 }
 
 static void 
@@ -62,6 +102,13 @@ ccnet_log (const gchar *log_domain, GLogLevelFlags log_level,
     } else { // log file not available
         printf("%s %s", buf, message);
     }
+
+#ifndef WIN32
+#ifdef SEAFILE_SERVER
+    if (enable_syslog)
+        syslog (get_syslog_level (log_level), "%s", message);
+#endif
+#endif
 }
 
 static int
@@ -173,3 +220,17 @@ seafile_debug_impl (SeafileDebugFlags flag, const gchar *format, ...)
         va_end (args);
     }
 }
+
+#ifndef WIN32
+#ifdef SEAFILE_SERVER
+void
+set_syslog_config (GKeyFile *config)
+{
+    enable_syslog = g_key_file_get_boolean (config,
+                                            "general", "enable_syslog",
+                                            NULL);
+    if (enable_syslog)
+        openlog (NULL, LOG_NDELAY | LOG_PID, LOG_USER);
+}
+#endif
+#endif

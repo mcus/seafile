@@ -103,6 +103,7 @@ const char *POST_CHECK_FS_REGEX = "^/repo/[\\da-z]{8}-[\\da-z]{4}-[\\da-z]{4}-[\
 const char *POST_CHECK_BLOCK_REGEX = "^/repo/[\\da-z]{8}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{12}/check-blocks";
 const char *POST_RECV_FS_REGEX = "^/repo/[\\da-z]{8}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{12}/recv-fs";
 const char *POST_PACK_FS_REGEX = "^/repo/[\\da-z]{8}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{12}/pack-fs";
+const char *GET_BLOCK_MAP_REGEX = "^/repo/[\\da-z]{8}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{12}/block-map/[\\da-z]{40}";
 
 static void
 load_http_config (HttpServerStruct *htp_server, SeafileSession *session)
@@ -511,6 +512,45 @@ get_client_ip_addr (evhtp_request_t *req)
     return g_strdup (ip);
 }
 
+static int
+validate_client_ver (const char *client_ver)
+{
+    int n_major;
+    int n_minor;
+    int n_build;
+    char **versions = NULL;
+    char *next_str = NULL;
+
+    versions = g_strsplit (client_ver, ".", 3);
+    if (g_strv_length (versions) != 3) {
+        g_strfreev (versions);
+        return EVHTP_RES_BADREQ;
+    }
+
+    n_major = strtoll (versions[0], &next_str, 10);
+    if (versions[0] == next_str) {
+        g_strfreev (versions);
+        return EVHTP_RES_BADREQ;
+    }
+
+    n_minor = strtoll (versions[1], &next_str, 10);
+    if (versions[1] == next_str) {
+        g_strfreev (versions);
+        return EVHTP_RES_BADREQ;
+    }
+
+    n_build = strtoll (versions[2], &next_str, 10);
+    if (versions[2] == next_str) {
+        g_strfreev (versions);
+        return EVHTP_RES_BADREQ;
+    }
+
+    // todo: judge whether version is too old, then return 426
+
+    g_strfreev (versions);
+    return EVHTP_RES_OK;
+}
+
 static void
 get_check_permission_cb (evhtp_request_t *req, void *arg)
 {
@@ -524,6 +564,15 @@ get_check_permission_cb (evhtp_request_t *req, void *arg)
     if (client_id && strlen(client_id) != 40) {
         evhtp_send_reply (req, EVHTP_RES_BADREQ);
         return;
+    }
+
+    const char *client_ver = evhtp_kv_find (req->uri->query, "client_ver");
+    if (client_ver) {
+        int status = validate_client_ver (client_ver);
+        if (status != EVHTP_RES_OK) {
+            evhtp_send_reply (req, status);
+            return;
+        }
     }
 
     char *client_name = NULL;
@@ -567,14 +616,17 @@ get_check_permission_cb (evhtp_request_t *req, void *arg)
     ip = get_client_ip_addr (req);
     if (!ip) {
         evhtp_send_reply (req, EVHTP_RES_SERVERR);
+        token = evhtp_kv_find (req->headers_in, "Seafile-Repo-Token");
+        seaf_warning ("[%s] Failed to get client ip.\n", token);
         goto out;
     }
 
     if (strcmp (op, "download") == 0) {
         on_repo_oper (htp_server, "repo-download-sync", repo_id, username, ip, client_name);
-    } else if (strcmp (op, "upload") == 0) {
-        on_repo_oper (htp_server, "repo-upload-sync", repo_id, username, ip, client_name);
     }
+    /* else if (strcmp (op, "upload") == 0) { */
+    /*     on_repo_oper (htp_server, "repo-upload-sync", repo_id, username, ip, client_name); */
+    /* } */
 
     if (client_id && client_name) {
         token = evhtp_kv_find (req->headers_in, "Seafile-Repo-Token");
@@ -588,12 +640,14 @@ get_check_permission_cb (evhtp_request_t *req, void *arg)
                                                    client_id,
                                                    ip,
                                                    client_name,
-                                                   (gint64)time(NULL));
+                                                   (gint64)time(NULL),
+                                                   client_ver);
         else
             seaf_repo_manager_update_token_peer_info (seaf->repo_mgr,
                                                       token,
                                                       ip,
-                                                      (gint64)time(NULL));
+                                                      (gint64)time(NULL),
+                                                      client_ver);
     }
 
     evhtp_send_reply (req, EVHTP_RES_OK);
@@ -888,7 +942,7 @@ put_update_branch_cb (evhtp_request_t *req, void *arg)
     SeafCommit *new_commit = NULL, *base = NULL;
 
     const char *new_commit_id = evhtp_kv_find (req->uri->query, "head");
-    if (new_commit_id == NULL || strlen (new_commit_id) != 40) {
+    if (new_commit_id == NULL || !is_object_id_valid (new_commit_id)) {
         evhtp_send_reply (req, EVHTP_RES_BADREQ);
         return;
     }
@@ -943,7 +997,7 @@ put_update_branch_cb (evhtp_request_t *req, void *arg)
     }
 
     if (fast_forward_or_merge (repo_id, base, new_commit) < 0) {
-        seaf_warning ("Fast forward merge is failed.\n");
+        seaf_warning ("Fast forward merge for repo %s is failed.\n", repo_id);
         evhtp_send_reply (req, EVHTP_RES_SERVERR);
         goto out;
     }
@@ -1040,6 +1094,7 @@ put_commit_cb (evhtp_request_t *req, void *arg)
     data = g_new0 (char, con_len);
     if (!data) {
         evhtp_send_reply (req, EVHTP_RES_SERVERR);
+        seaf_warning ("Failed to allocate %d bytes memory.\n", con_len);
         goto out;
     }
 
@@ -1095,6 +1150,12 @@ collect_file_ids (int n, const char *basedir, SeafDirent *files[], void *data)
 }
 
 static int
+collect_file_ids_nop (int n, const char *basedir, SeafDirent *files[], void *data)
+{
+    return 0;
+}
+
+static int
 collect_dir_ids (int n, const char *basedir, SeafDirent *dirs[], void *data,
                  gboolean *recurse)
 {
@@ -1113,6 +1174,7 @@ static int
 calculate_send_object_list (SeafRepo *repo,
                             const char *server_head,
                             const char *client_head,
+                            gboolean dir_only,
                             GList **results)
 {
     SeafCommit *remote_head = NULL, *master_head = NULL;
@@ -1152,7 +1214,10 @@ calculate_send_object_list (SeafRepo *repo,
     memset (&opts, 0, sizeof(opts));
     memcpy (opts.store_id, repo->store_id, 36);
     opts.version = repo->version;
-    opts.file_cb = collect_file_ids;
+    if (!dir_only)
+        opts.file_cb = collect_file_ids;
+    else
+        opts.file_cb = collect_file_ids_nop;
     opts.dir_cb = collect_dir_ids;
     opts.data = results;
 
@@ -1179,15 +1244,29 @@ get_fs_obj_id_cb (evhtp_request_t *req, void *arg)
     char **parts;
     char *repo_id;
     SeafRepo *repo = NULL;
+    gboolean dir_only = FALSE;
 
     const char *server_head = evhtp_kv_find (req->uri->query, "server-head");
-    if (server_head == NULL || strlen (server_head) != 40) {
+    if (server_head == NULL || !is_object_id_valid (server_head)) {
         char *error = "Invalid server-head parameter.\n";
         seaf_warning ("%s", error);
         evbuffer_add (req->buffer_out, error, strlen (error));
         evhtp_send_reply (req, EVHTP_RES_BADREQ);
         return;
     }
+
+    const char *client_head = evhtp_kv_find (req->uri->query, "client-head");
+    if (client_head && !is_object_id_valid (client_head)) {
+        char *error = "Invalid client-head parameter.\n";
+        seaf_warning ("%s", error);
+        evbuffer_add (req->buffer_out, error, strlen (error));
+        evhtp_send_reply (req, EVHTP_RES_BADREQ);
+        return;
+    }
+
+    const char *dir_only_arg = evhtp_kv_find (req->uri->query, "dir-only");
+    if (dir_only_arg)
+        dir_only = TRUE;
 
     parts = g_strsplit (req->uri->path->full + 1, "/", 0);
     repo_id = parts[1];
@@ -1198,7 +1277,6 @@ get_fs_obj_id_cb (evhtp_request_t *req, void *arg)
         goto out;
     }
 
-    const char *client_head = evhtp_kv_find (req->uri->query, "client-head");
     GList *list = NULL, *ptr;
 
     repo = seaf_repo_manager_get_repo (seaf->repo_mgr, repo_id);
@@ -1208,7 +1286,7 @@ get_fs_obj_id_cb (evhtp_request_t *req, void *arg)
         goto out;
     }
 
-    if (calculate_send_object_list (repo, server_head, client_head, &list) < 0) {
+    if (calculate_send_object_list (repo, server_head, client_head, dir_only, &list) < 0) {
         evhtp_send_reply (req, EVHTP_RES_SERVERR);
         goto out;
     }
@@ -1277,6 +1355,7 @@ get_block_cb (evhtp_request_t *req, void *arg)
     void *block_con = g_new0 (char, blk_meta->size);
     if (!block_con) {
         evhtp_send_reply (req, EVHTP_RES_SERVERR);
+        seaf_warning ("Failed to allocate %d bytes memeory.\n", blk_meta->size);
         goto free_handle;
     }
 
@@ -1345,6 +1424,7 @@ put_send_block_cb (evhtp_request_t *req, void *arg)
     blk_con = g_new0 (char, blk_len);
     if (!blk_con) {
         evhtp_send_reply (req, EVHTP_RES_SERVERR);
+        seaf_warning ("Failed to allocate %d bytes memory.\n", blk_len);
         goto out;
     }
 
@@ -1435,6 +1515,7 @@ post_check_exist_cb (evhtp_request_t *req, void *arg, CheckExistType type)
     char *obj_list_con = g_new0 (char, list_len);
     if (!obj_list_con) {
         evhtp_send_reply (req, EVHTP_RES_SERVERR);
+        seaf_warning ("Failed to allocate %zu bytes memory.\n", list_len);
         goto out;
     }
 
@@ -1460,7 +1541,7 @@ post_check_exist_cb (evhtp_request_t *req, void *arg, CheckExistType type)
     for (; index < array_size; ++index) {
         obj = json_array_get (obj_array, index);
         obj_id = json_string_value (obj);
-        if (strlen (obj_id) != 40)
+        if (!is_object_id_valid (obj_id))
             continue;
 
         if (type == CHECK_FS_EXIST) {
@@ -1559,6 +1640,11 @@ post_recv_fs_cb (evhtp_request_t *req, void *arg)
         memcpy (obj_id, hdr->obj_id, 40);
         obj_id[40] = 0;
 
+        if (!is_object_id_valid (obj_id)) {
+            evhtp_send_reply (req, EVHTP_RES_BADREQ);
+            break;
+        }
+
         obj_con = g_new0 (char, con_len);
         if (!obj_con) {
             evhtp_send_reply (req, EVHTP_RES_SERVERR);
@@ -1622,6 +1708,7 @@ post_pack_fs_cb (evhtp_request_t *req, void *arg)
     char *fs_id_list = g_new0 (char, fs_id_list_len);
     if (!fs_id_list) {
         evhtp_send_reply (req, EVHTP_RES_SERVERR);
+        seaf_warning ("Failed to allocate %d bytes memory.\n", fs_id_list_len);
         goto out;
     }
 
@@ -1651,7 +1738,7 @@ post_pack_fs_cb (evhtp_request_t *req, void *arg)
         obj = json_array_get (fs_id_array, index);
         obj_id = json_string_value (obj);
 
-        if (strlen (obj_id) != 40) {
+        if (!is_object_id_valid (obj_id)) {
             seaf_warning ("Invalid fs id %s.\n", obj_id);
             evhtp_send_reply (req, EVHTP_RES_BADREQ);
             json_decref (fs_id_array);
@@ -1682,6 +1769,72 @@ post_pack_fs_cb (evhtp_request_t *req, void *arg)
     json_decref (fs_id_array);
 out:
     g_free (store_id);
+    g_strfreev (parts);
+}
+
+static void
+get_block_map_cb (evhtp_request_t *req, void *arg)
+{
+    const char *repo_id = NULL;
+    char *file_id = NULL;
+    char *store_id = NULL;
+    HttpServer *htp_server = arg;
+    Seafile *file = NULL;
+    char *block_id;
+    BlockMetadata *blk_meta = NULL;
+    json_t *array = NULL;
+    char *data = NULL;
+
+    char **parts = g_strsplit (req->uri->path->full + 1, "/", 0);
+    repo_id = parts[1];
+    file_id = parts[3];
+
+    int token_status = validate_token (htp_server, req, repo_id, NULL, FALSE);
+    if (token_status != EVHTP_RES_OK) {
+        evhtp_send_reply (req, token_status);
+        goto out;
+    }
+
+    store_id = get_repo_store_id (htp_server, repo_id);
+    if (!store_id) {
+        evhtp_send_reply (req, EVHTP_RES_SERVERR);
+        goto out;
+    }
+
+    file = seaf_fs_manager_get_seafile (seaf->fs_mgr, store_id, 1, file_id);
+    if (!file) {
+        evhtp_send_reply (req, EVHTP_RES_NOTFOUND);
+        goto out;
+    }
+
+    array = json_array ();
+
+    int i;
+    for (i = 0; i < file->n_blocks; ++i) {
+        block_id = file->blk_sha1s[i];
+        blk_meta = seaf_block_manager_stat_block (seaf->block_mgr,
+                                                  store_id, 1, block_id);
+        if (blk_meta == NULL) {
+            seaf_warning ("Failed to find block %s/%s\n", store_id, block_id);
+            evhtp_send_reply (req, EVHTP_RES_SERVERR);
+            g_free (blk_meta);
+            goto out;
+        }
+        json_array_append_new (array, json_integer(blk_meta->size));
+        g_free (blk_meta);
+    }
+
+    data = json_dumps (array, JSON_COMPACT);
+    evbuffer_add (req->buffer_out, data, strlen (data));
+    evhtp_send_reply (req, EVHTP_RES_OK);
+
+out:
+    g_free (store_id);
+    seafile_unref (file);
+    if (array)
+        json_decref (array);
+    if (data)
+        free (data);
     g_strfreev (parts);
 }
 
@@ -1732,6 +1885,10 @@ http_request_init (HttpServerStruct *server)
 
     evhtp_set_regex_cb (priv->evhtp,
                         POST_PACK_FS_REGEX, post_pack_fs_cb,
+                        priv);
+
+    evhtp_set_regex_cb (priv->evhtp,
+                        GET_BLOCK_MAP_REGEX, get_block_map_cb,
                         priv);
 
     /* Web access file */

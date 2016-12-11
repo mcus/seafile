@@ -6,6 +6,7 @@ SCRIPT=$(readlink -f "$0")
 INSTALLPATH=$(dirname "${SCRIPT}")
 TOPDIR=$(dirname "${INSTALLPATH}")
 default_ccnet_conf_dir=${TOPDIR}/ccnet
+default_conf_dir=${TOPDIR}/conf
 seaf_fsck=${INSTALLPATH}/seafile/bin/seaf-fsck
 
 export PATH=${INSTALLPATH}/seafile/bin:$PATH
@@ -14,7 +15,7 @@ export SEAFILE_LD_LIBRARY_PATH=${INSTALLPATH}/seafile/lib/:${INSTALLPATH}/seafil
 script_name=$0
 function usage () {
     echo "usage : "
-    echo "$(basename ${script_name}) [-h/--help] [-r/--repair] [-e/--enable-sync] [repo_id_1 [repo_id_2 ...]]"
+    echo "$(basename ${script_name}) [-h/--help] [-r/--repair] [-E/--export path_to_export] [repo_id_1 [repo_id_2 ...]]"
     echo ""
 }
 
@@ -51,6 +52,7 @@ function run_seaf_fsck () {
 
     LD_LIBRARY_PATH=$SEAFILE_LD_LIBRARY_PATH ${seaf_fsck} \
         -c "${default_ccnet_conf_dir}" -d "${seafile_data_dir}" \
+        -F "${default_conf_dir}" \
         ${seaf_fsck_opts}
 
     echo "seaf-fsck run done"
